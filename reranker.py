@@ -46,7 +46,7 @@ class Reranker:
         return sorted_chunks[:k]
     
     def remove_duplicates(self, retrieved_chunks: List[Dict[str, Any]], 
-                         similarity_threshold: float = 0.95) -> List[Dict[str, Any]]:
+                         similarity_threshold: float = 0.9) -> List[Dict[str, Any]]:
         """
         Remove near-duplicate chunks based on text similarity
         
@@ -223,21 +223,3 @@ class Reranker:
         }
         
         return stats
-    
-    # Placeholder for future reranking implementation
-    def rerank_chunks(self, query: str, retrieved_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Placeholder for future reranking implementation
-        Currently returns chunks in original order
-        
-        Args:
-            query: Original query string
-            retrieved_chunks: List of chunks to rerank
-            
-        Returns:
-            Reranked list of chunks (currently unchanged)
-        """
-        # TODO: Implement sophisticated reranking using cross-encoder models
-        # or other advanced techniques in future iterations
-        print("Reranking not implemented yet. Returning original order.")
-        return retrieved_chunks

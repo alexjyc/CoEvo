@@ -92,13 +92,7 @@ def run_basic_demo():
         print(f"Expected Answer: {query_data['ground_truth']}")
         
         # Process query through pipeline
-        result = pipeline.query(
-            query=query_data['query'],
-            retrieval_k=8,
-            final_k=3,
-            use_financial_prompt=True,
-            max_tokens=300
-        )
+        result = pipeline.query(query=query_data['query'])
         
         print(f"Generated Answer: {result['response']}")
         print(f"Retrieved {result['retrieval_stats']['initial_retrieved']} chunks, used {result['retrieval_stats']['final_processed']}")
@@ -144,8 +138,8 @@ def run_evaluation_demo():
     print("\n=== Evaluation Results ===")    
     print("\nIndividual Query Results:")
     for i, result in enumerate(batch_results):
-        final_eval = result.get('final_assessment', False)
-        confidence = result.get('confidence_score', 0.0)
+        final_eval = result.final_assessment
+        confidence = result.confidence_score
         status = "✅" if final_eval else "❌"
 
         print(f"   Result: {'PASS' if final_eval else 'FAIL'} (Confidence: {confidence:.3f})")
@@ -185,13 +179,8 @@ def interactive_demo():
             continue
         
         try:
-            result = pipeline.query(
-                query=query,
-                retrieval_k=8,
-                final_k=3,
-                use_financial_prompt=True,
-                max_tokens=400
-            )
+            result = pipeline.query(query=query)
+             
             
             print(f"\nAnswer: {result['response']}")
             print(f"(Based on {result['retrieval_stats']['final_processed']} relevant document chunks)")

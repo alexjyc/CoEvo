@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
 from preprocessor import DocumentPreprocessor
-from retrieval import BasicRetriever
+from retrieval import Retriever, RetrievalMethod
 from reranker import Reranker
 from generation import ResponseGenerator
 from evaluation import LLMJudge
@@ -44,8 +44,6 @@ class RAGPipeline:
         self.reranker = Reranker(default_k=5)
         self.generator = ResponseGenerator(openai_api_key, generation_model, temperature)
         self.llm_judge = LLMJudge(openai_api_key, judge_model, judge_confidence_threshold)
-        # self.evaluator = RAGEvaluator()
-        
         self.is_ready = False
     
     def load_and_process_documents(self, documents: List[Dict[str, Any]]) -> None:
@@ -61,7 +59,7 @@ class RAGPipeline:
         self.preprocessor.process_documents(documents)
         
         # Initialize retriever with processed index
-        self.retriever = BasicRetriever(self.preprocessor, self.api_key)
+        self.retriever = Retriever(self.preprocessor, self.api_key)
         
         self.is_ready = True
         print(f"Pipeline ready! Processed {len(documents)} documents.")
@@ -80,7 +78,7 @@ class RAGPipeline:
         self.preprocessor.load_index(index_path, metadata_path)
         
         # Initialize retriever
-        self.retriever = BasicRetriever(self.preprocessor, self.api_key)
+        self.retriever = Retriever(self.preprocessor, self.api_key)
         
         self.is_ready = True
         print("Pipeline loaded successfully!")
@@ -103,9 +101,8 @@ class RAGPipeline:
               final_k: int = 5,
               remove_duplicates: bool = True,
               filter_length: bool = True,
-              diversify: bool = True,
-              max_tokens: int = 500,
-              use_financial_prompt: bool = False) -> Dict[str, Any]:
+              diversify: bool = True
+            ) -> Dict[str, Any]:
         """
         Process a query through the complete RAG pipeline
         
@@ -129,7 +126,7 @@ class RAGPipeline:
         
         # Step 1: Retrieval
         print("1. Retrieving relevant chunks...")
-        retrieved_chunks = self.retriever.retrieve(query, retrieval_k)
+        retrieved_chunks = self.retriever.retrieve(query, retrieval_k, method=RetrievalMethod.BM25_ONLY)
         
         # Step 2: Reranking
         print("2. Reranking chunks...")
@@ -143,14 +140,8 @@ class RAGPipeline:
         
         # Step 3: Generation
         print("3. Generating response...")
-        if use_financial_prompt:
-            generation_result = self.generator.generate_financial_response(
-                query, processed_chunks, max_tokens
-            )
-        else:
-            generation_result = self.generator.generate_with_chunks(
-                query, processed_chunks, max_tokens=max_tokens
-            )
+        generation_result = self.generator.generate_with_chunks(query, processed_chunks)
+            
         
         # Step 4: Compile results
         pipeline_result = {
@@ -198,16 +189,22 @@ class RAGPipeline:
         for i, data in enumerate(evaluation_data):
             print(f"\nProcessing query {i+1}/{len(evaluation_data)}")
 
+            # print(data.get('query'))
+            # print(data.get('ground_truth'))
+            # print(data.get('generated_response'))
+            # print(data.get('context'))
+
             result = self.llm_judge.judge_response(
-                generated_response=data['generated_response'],
-                ground_truth=data['ground_truth'],
-                query=data['query'],
-                context=data['context']
+                generated_response=data.get('generated_response'),
+                ground_truth=data.get('ground_truth'),
+                query=data.get('query'),
+                context=data.get('context')
             )
-            
+
+            # print(result.confidence_score)
+            # print(result.final_assessment)
             results.append(result)
 
-        
         return results
     
     def get_pipeline_info(self) -> Dict[str, Any]:

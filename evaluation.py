@@ -37,7 +37,6 @@ class JudgmentOutput(BaseModel):
         description="Final assessment of the generated response"
     )
 
-
 class LLMJudge:
     """
     LLM-as-judge for assessing generated responses against ground truth
@@ -93,9 +92,7 @@ class LLMJudge:
                 response_format=JudgmentOutput,
             )
             
-            
-            # Parse the JSON response
-            judgment_data = response.choices[0].message.parsed.model_dump()
+            judgment_data = response.choices[0].message.parsed
             
             return judgment_data
             

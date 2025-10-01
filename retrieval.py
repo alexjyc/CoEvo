@@ -4,13 +4,24 @@ Handles similarity search and context retrieval from FAISS index
 """
 
 import numpy as np
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import faiss
 from openai import OpenAI
 from preprocessor import DocumentPreprocessor
+from enum import Enum
+from rank_bm25 import BM25Okapi
+import re
+from collections import defaultdict
 
 
-class BasicRetriever:
+class RetrievalMethod(Enum):
+    """Enumeration of available retrieval methods"""
+    BM25_ONLY = "bm25_only"
+    DENSE_ONLY = "dense_only"
+    HYBRID = "hybrid"
+
+
+class Retriever:
     """
     Handles basic retrieval of relevant document chunks using FAISS similarity search
     """
@@ -25,6 +36,44 @@ class BasicRetriever:
         """
         self.preprocessor = preprocessor
         self.client = OpenAI(api_key=openai_api_key)
+
+        # BM25 components
+        self.bm25_corpus = None
+        self.bm25_index = None
+
+        if self.preprocessor.chunks:
+            self._build_bm25_index()
+
+    def _build_bm25_index(self):
+        """Build BM25 index from preprocessed chunks"""
+        print("Building BM25 index...")
+        
+        # Tokenize all chunks for BM25
+        self.bm25_corpus = []
+        for chunk in self.preprocessor.chunks:
+            tokens = self._tokenize_text(chunk)
+            self.bm25_corpus.append(tokens)
+        
+        # Create BM25 index
+        self.bm25_index = BM25Okapi(self.bm25_corpus)
+        print(f"BM25 index built with {len(self.bm25_corpus)} documents")
+    
+    def _tokenize_text(self, text: str) -> List[str]:
+        """
+        Simple tokenization for BM25
+        
+        Args:
+            text: Input text to tokenize
+            
+        Returns:
+            List of tokens
+        """
+        # Convert to lowercase and split on whitespace and punctuation
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
+        tokens = text.split()
+        # Remove very short tokens
+        tokens = [token for token in tokens if len(token) > 2]
+        return tokens
     
     def embed_query(self, query: str) -> List[float]:
         """
@@ -45,8 +94,46 @@ class BasicRetriever:
         except Exception as e:
             print(f"Error generating query embedding: {e}")
             return [0.0] * 1536  # Return zero vector as fallback
+
+    def retrieve_bm25(self, query: str, max_candidates: int = 20) -> List[Dict[str, Any]]:
+        """
+        Retrieve using BM25
+        
+        Args:
+            query: Query string
+            max_candidates: Number of chunks to retrieve
+            
+        Returns:
+            List of retrieved chunks with metadata and similarity scores
+        """
+        if self.bm25_index is None:
+            raise ValueError("BM25 index not built. Please build the index first.")
+
+        query_tokens = self._tokenize_text(query)
+
+        bm25_scores = self.bm25_index.get_scores(query_tokens)
+
+        top_indices = np.argsort(bm25_scores)[::-1][:max_candidates]
+
+        retrieved_chunks = []
+
+        for i, idx in enumerate(top_indices):
+            if idx < len(self.preprocessor.chunks) and bm25_scores[idx] > 0:
+                chunk_data = {
+                    'rank': i + 1,
+                    'chunk_text': self.preprocessor.chunks[idx],
+                    'similarity_score': float(bm25_scores[idx]),
+                    'bm25_score': float(bm25_scores[idx]),
+                    'dense_score': 0.0,  # No dense score for BM25-only
+                    'chunk_metadata': self.preprocessor.chunk_metadata[idx],
+                    'chunk_index': int(idx),
+                    'retrieval_method': 'bm25_only'
+                }
+                retrieved_chunks.append(chunk_data)
+        
+        return retrieved_chunks
     
-    def retrieve(self, query: str, max_candidates: int = 20) -> List[Dict[str, Any]]:
+    def retrieve_dense(self, query: str, max_candidates: int = 20) -> List[Dict[str, Any]]:
         """
         Retrieve top-k most similar document chunks for a given query
         
@@ -79,91 +166,145 @@ class BasicRetriever:
                     'rank': i + 1,
                     'chunk_text': self.preprocessor.chunks[idx],
                     'similarity_score': float(similarity),
+                    'dense_score': float(similarity),
+                    'bm25_score': 0.0,  # No BM25 score for dense-only
                     'chunk_metadata': self.preprocessor.chunk_metadata[idx],
-                    'chunk_index': int(idx)
+                    'chunk_index': int(idx),
+                    'retrieval_method': 'dense_only'
                 }
                 retrieved_chunks.append(chunk_data)
         
         return retrieved_chunks
-    
-    def retrieve_with_threshold(self, query: str, max_candidates: int = 50, similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+
+    def retrieve_hybrid(self, query: str, k: int = 20, 
+                       bm25_weight: float = 0.3, 
+                       dense_weight: float = 0.7,
+                       bm25_k: int = 50,
+                       dense_k: int = 50) -> List[Dict[str, Any]]:
         """
-        Retrieve document chunks that exceed a similarity threshold
+        Retrieve using hybrid approach (BM25 + Dense)
         
         Args:
             query: Query string
-            max_candidates: Maximum number of chunks to consider
-            similarity_threshold: Minimum similarity score for inclusion
+            k: Final number of chunks to return
+            bm25_weight: Weight for BM25 scores (0.0 to 1.0)
+            dense_weight: Weight for dense scores (0.0 to 1.0)
+            bm25_k: Number of candidates to retrieve from BM25
+            dense_k: Number of candidates to retrieve from dense
             
         Returns:
-            List of retrieved chunks above the similarity threshold
+            List of retrieved chunks with hybrid scores
         """
-        # First retrieve top_k candidates
-        candidates = self.retrieve(query, max_candidates)
+        # Get candidates from both methods
+        bm25_results = self.retrieve_bm25(query, bm25_k)
+        dense_results = self.retrieve_dense(query, dense_k)
         
-        # Filter by similarity threshold
-        filtered_chunks = [
-            chunk for chunk in candidates 
-            if chunk['similarity_score'] >= similarity_threshold
-        ]
+        # Normalize scores to [0, 1] range
+        bm25_scores_norm = self._normalize_scores([r['bm25_score'] for r in bm25_results])
+        dense_scores_norm = self._normalize_scores([r['dense_score'] for r in dense_results])
         
-        return filtered_chunks
+        # Update normalized scores
+        for i, result in enumerate(bm25_results):
+            result['bm25_score_norm'] = bm25_scores_norm[i] if i < len(bm25_scores_norm) else 0.0
+        
+        for i, result in enumerate(dense_results):
+            result['dense_score_norm'] = dense_scores_norm[i] if i < len(dense_scores_norm) else 0.0
+        
+        # Combine results and calculate hybrid scores
+        chunk_scores = defaultdict(lambda: {'bm25_score': 0.0, 'dense_score': 0.0, 'bm25_score_norm': 0.0, 'dense_score_norm': 0.0, 'chunk_data': None})
+        
+        # Add BM25 results
+        for result in bm25_results:
+            idx = result['chunk_index']
+            chunk_scores[idx]['bm25_score'] = result['bm25_score']
+            chunk_scores[idx]['bm25_score_norm'] = result.get('bm25_score_norm', 0.0)
+            chunk_scores[idx]['chunk_data'] = result
+        
+        # Add dense results
+        for result in dense_results:
+            idx = result['chunk_index']
+            chunk_scores[idx]['dense_score'] = result['dense_score']
+            chunk_scores[idx]['dense_score_norm'] = result.get('dense_score_norm', 0.0)
+            if chunk_scores[idx]['chunk_data'] is None:
+                chunk_scores[idx]['chunk_data'] = result
+        
+        # Calculate hybrid scores and create final results
+        hybrid_results = []
+        
+        for idx, scores in chunk_scores.items():
+            # Calculate hybrid score using normalized scores
+            hybrid_score = (bm25_weight * scores['bm25_score_norm'] + 
+                          dense_weight * scores['dense_score_norm'])
+            
+            chunk_data = scores['chunk_data'].copy()
+            chunk_data.update({
+                'similarity_score': hybrid_score,
+                'hybrid_score': hybrid_score,
+                'bm25_score': scores['bm25_score'],
+                'dense_score': scores['dense_score'],
+                'bm25_score_norm': scores['bm25_score_norm'],
+                'dense_score_norm': scores['dense_score_norm'],
+                'bm25_weight': bm25_weight,
+                'dense_weight': dense_weight,
+                'retrieval_method': 'hybrid'
+            })
+            
+            hybrid_results.append(chunk_data)
+        
+        # Sort by hybrid score and return top k
+        hybrid_results.sort(key=lambda x: x['hybrid_score'], reverse=True)
+        
+        # Update ranks
+        for i, result in enumerate(hybrid_results[:k]):
+            result['rank'] = i + 1
+        
+        return hybrid_results[:k]
     
-    def get_retrieval_stats(self, query: str, top_k: int = 10) -> Dict[str, Any]:
+    def _normalize_scores(self, scores: List[float]) -> List[float]:
         """
-        Get detailed statistics about the retrieval process
+        Normalize scores to [0, 1] range using min-max normalization
+        
+        Args:
+            scores: List of scores to normalize
+            
+        Returns:
+            List of normalized scores
+        """
+        if not scores:
+            return scores
+        
+        min_score = min(scores)
+        max_score = max(scores)
+        
+        if max_score == min_score:
+            return [1.0] * len(scores)  # All scores are the same
+        
+        return [(score - min_score) / (max_score - min_score) for score in scores]
+    
+    def retrieve(self, query: str, k: int = 20, 
+                method: Optional[RetrievalMethod] = None,
+                **kwargs) -> List[Dict[str, Any]]:
+        """
+        Main retrieval method that dispatches to specific retrieval methods
         
         Args:
             query: Query string
-            top_k: Number of top chunks to analyze
+            k: Number of chunks to retrieve
+            method: Retrieval method to use (defaults to self.default_method)
+            **kwargs: Additional arguments for specific retrieval methods
             
         Returns:
-            Dictionary containing retrieval statistics
+            List of retrieved chunks
         """
-        retrieved_chunks = self.retrieve(query, top_k)
+        method = method or self.default_method
         
-        if not retrieved_chunks:
-            return {"error": "No chunks retrieved"}
+        print(f"Retrieving with method: {method.value}")
         
-        similarities = [chunk['similarity_score'] for chunk in retrieved_chunks]
-        
-        stats = {
-            'query': query,
-            'num_retrieved': len(retrieved_chunks),
-            'max_similarity': max(similarities),
-            'min_similarity': min(similarities),
-            'avg_similarity': sum(similarities) / len(similarities),
-            'similarity_std': np.std(similarities),
-            'unique_documents': len(set(chunk['chunk_metadata']['doc_id'] for chunk in retrieved_chunks))
-        }
-        
-        return stats
-    
-    def format_context(self, retrieved_chunks: List[Dict[str, Any]], max_context_length: int = 4000) -> str:
-        """
-        Format retrieved chunks into a context string for the generation module
-        
-        Args:
-            retrieved_chunks: List of retrieved chunk dictionaries
-            max_context_length: Maximum length of context in characters
-            
-        Returns:
-            Formatted context string
-        """
-        context_parts = []
-        current_length = 0
-        
-        for chunk in retrieved_chunks:
-            chunk_text = chunk['chunk_text']
-            score = chunk['similarity_score']
-            
-            # Format with similarity score for better context understanding
-            formatted_chunk = f"[Relevance: {score:.3f}] {chunk_text}"
-            
-            if current_length + len(formatted_chunk) > max_context_length:
-                break
-                
-            context_parts.append(formatted_chunk)
-            current_length += len(formatted_chunk)
-        
-        return "\n\n".join(context_parts)
+        if method == RetrievalMethod.BM25_ONLY:
+            return self.retrieve_bm25(query, k)
+        elif method == RetrievalMethod.DENSE_ONLY:
+            return self.retrieve_dense(query, k)
+        elif method == RetrievalMethod.HYBRID:
+            return self.retrieve_hybrid(query, k, **kwargs)
+        else:
+            raise ValueError(f"Unknown retrieval method: {method}")
