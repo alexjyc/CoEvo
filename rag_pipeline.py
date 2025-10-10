@@ -4,15 +4,18 @@ Integrates all components: Preprocessor, Retrieval, Reranking, Generation, and E
 """
 
 import os
+import asyncio
 from typing import List, Dict, Any, Optional
+import time
 from dotenv import load_dotenv
+
 
 from preprocessor import DocumentPreprocessor
 from retrieval import Retriever, RetrievalMethod
 from reranker import Reranker
 from generation import ResponseGenerator
-from evaluation import LLMJudge
-
+from evaluation import Evaluator
+from langfuse import get_client
 
 class RAGPipeline:
     """
@@ -24,8 +27,7 @@ class RAGPipeline:
                  chunk_overlap: int = 50,
                  generation_model: str = "gpt-4o-mini",
                  temperature: float = 0,
-                 judge_model: str = "gpt-4o-mini",
-                 judge_confidence_threshold: float = 0.8):
+                 retrieval_method: str = "hybrid"):
         """
         Initialize the complete RAG pipeline
         
@@ -43,8 +45,19 @@ class RAGPipeline:
         self.retriever = None  # Will be initialized after preprocessing
         self.reranker = Reranker(default_k=5)
         self.generator = ResponseGenerator(openai_api_key, generation_model, temperature)
-        self.llm_judge = LLMJudge(openai_api_key, judge_model, judge_confidence_threshold)
+        self.evaluator = Evaluator(openai_api_key)
         self.is_ready = False
+
+        self.langfuse_context = get_client()
+
+        if retrieval_method == "hybrid":
+            self.retrieval_method = RetrievalMethod.HYBRID
+        elif retrieval_method == "bm25":
+            self.retrieval_method = RetrievalMethod.BM25_ONLY
+        elif retrieval_method == "dense":
+            self.retrieval_method = RetrievalMethod.DENSE_ONLY
+        else:
+            raise ValueError(f"Invalid retrieval method: {retrieval_method}")
     
     def load_and_process_documents(self, documents: List[Dict[str, Any]]) -> None:
         """
@@ -96,12 +109,10 @@ class RAGPipeline:
         
         self.preprocessor.save_index(index_path, metadata_path)
     
-    def query(self, query: str, 
-              retrieval_k: int = 10,
-              final_k: int = 5,
-              remove_duplicates: bool = True,
-              filter_length: bool = True,
-              diversify: bool = True
+    async def query_with_eval(self, query: str, 
+            ground_truth: str,
+            retrieval_k: int = 10,
+            final_k: int = 5,
             ) -> Dict[str, Any]:
         """
         Process a query through the complete RAG pipeline
@@ -110,11 +121,6 @@ class RAGPipeline:
             query: User's question
             retrieval_k: Number of chunks to retrieve initially
             final_k: Final number of chunks to use for generation
-            remove_duplicates: Whether to remove duplicate chunks
-            filter_length: Whether to filter chunks by length
-            diversify: Whether to diversify source documents
-            max_tokens: Maximum tokens for generation
-            use_financial_prompt: Whether to use financial-specific prompt
             
         Returns:
             Dictionary containing complete pipeline results
@@ -122,117 +128,130 @@ class RAGPipeline:
         if not self.is_ready:
             raise ValueError("Pipeline not ready. Load documents or saved index first.")
         
-        print(f"Processing query: {query}")
-        
-        # Step 1: Retrieval
-        print("1. Retrieving relevant chunks...")
-        retrieved_chunks = self.retriever.retrieve(query, retrieval_k, method=RetrievalMethod.BM25_ONLY)
-        
-        # Step 2: Reranking
-        print("2. Reranking chunks...")
-        processed_chunks = self.reranker.process_chunks(
-            retrieved_chunks,
-            k=final_k,
-            remove_duplicates=remove_duplicates,
-            filter_length=filter_length,
-            diversify=diversify
-        )
-        
-        # Step 3: Generation
-        print("3. Generating response...")
-        generation_result = self.generator.generate_with_chunks(query, processed_chunks)
-            
-        
-        # Step 4: Compile results
-        pipeline_result = {
-            'query': query,
-            'retrieved_chunks': retrieved_chunks,
-            'processed_chunks': processed_chunks,
-            'generation_result': generation_result,
-            'response': generation_result.get('response', 'No response generated'),
-            'retrieval_stats': {
-                'initial_retrieved': len(retrieved_chunks),
-                'final_processed': len(processed_chunks),
-                'avg_similarity': sum(c['similarity_score'] for c in retrieved_chunks) / len(retrieved_chunks) if retrieved_chunks else 0
-            }
-        }
-        
-        print("4. Query processing complete!")
-        return pipeline_result
+        print(f"Processing query with Langfuse tracing: {query}")
 
+        with self.langfuse_context.start_as_current_span(name="rag") as trace:
+            # Store trace_id for later use
+            trace_id = trace.trace_id
 
-    def batch_query(self, queries: List[str], **query_kwargs) -> List[Dict[str, Any]]:
+            with trace.start_as_current_span(
+                name="retrieval",
+                input={'question': query, 'retrieval_k': retrieval_k, 'method': self.retrieval_method.value}
+            ) as retrieval_span:
+                print("1. Retrieving relevant chunks...")
+                retrieved_chunks = self.retriever.retrieve(query, retrieval_k, method=self.retrieval_method)
+
+                contexts = [chunk['chunk_text'] for chunk in retrieved_chunks]
+                retrieval_output = {
+                    'contexts': contexts,
+                    'num_retrieved': len(retrieved_chunks),
+                    'avg_similarity': sum(c['similarity_score'] for c in retrieved_chunks) / len(retrieved_chunks) if retrieved_chunks else 0,
+                    'retrieval_method': self.retrieval_method.value
+                }
+                retrieval_span.update(output=retrieval_output)
+
+            with trace.start_as_current_span(
+                name="reranking",
+                input={'retrieved_chunks': len(retrieved_chunks), 'target_k': final_k}
+            ) as reranking_span:
+                print("2. Reranking chunks...")
+                processed_chunks = self.reranker.process_chunks(
+                    retrieved_chunks,
+                    k=final_k,
+                    remove_duplicates=True,
+                    filter_length=True,
+                    diversify=True
+                )
+                rerank_output = {
+                    'processed_chunks': len(processed_chunks),
+                    'final_contexts': [chunk['chunk_text'] for chunk in processed_chunks]
+                }
+                reranking_span.update(output=rerank_output)
+
+            with trace.start_as_current_span(
+                name="generation",
+                input={'question': query, 'contexts': [chunk['chunk_text'] for chunk in processed_chunks]}
+            ) as generation_span:
+                print("3. Generating response...")
+                generation_result = self.generator.generate_with_chunks(
+                    query, processed_chunks
+                )
+                generation_output = {
+                    'answer': generation_result.get('response', 'No response generated'),
+                }
+                generation_span.update(output=generation_output)
+
+            print("4. Evaluating response...")
+            evaluation_scores = await self.evaluator.evaluate_trace(query, contexts, generation_result.get('response', 'No response generated'), ground_truth)
+
+            for key, value in evaluation_scores.items():
+                trace.score(
+                    name=key,
+                    value=value,
+                    data_type="NUMERIC"
+                )
+
+        return evaluation_scores
+
+    async def batch_query(self, dataset: List[Dict[str, str]], 
+                               retrieval_k: int = 10, final_k: int = 5,
+                               max_concurrent: int = 5) -> List[Dict[str, Any]]:
         """
-        Process multiple queries through the complete RAG pipeline
-        """
-        return [self.query(query, **query_kwargs) for query in queries]
-    
-    
-    def batch_judge(self, evaluation_data: List[Dict[str, Any]], **query_kwargs) -> Dict[str, Any]:
-        """
-        Process multiple queries and judge them against ground truth
+        Process large datasets using asyncio concurrency (BEST for API-heavy workloads)
         
         Args:
-            evaluation_data: List of dicts with 'query' and 'ground_truth' keys
-            **query_kwargs: Additional arguments for query method
+            dataset: List of {'query': str, 'ground_truth': str}
+            max_concurrent: Maximum concurrent tasks
             
         Returns:
-            Dictionary containing batch results and statistics
+            List of evaluation results
         """
-        if not self.is_ready:
-            raise ValueError("Pipeline not ready. Load documents or saved index first.")
+        print(f"🚀 Processing {len(dataset)} queries with asyncio (max_concurrent={max_concurrent})")
         
-        print(f"Processing {len(evaluation_data)} queries with LLM judgment...")
+        semaphore = asyncio.Semaphore(max_concurrent)
+        start_time = time.time()
         
-        results = []
+        async def process_with_semaphore(item: Dict[str, str]) -> Dict[str, Any]:
+            async with semaphore:
+                try:
+                    result = await self.query_with_eval(
+                        query=item['query'],
+                        ground_truth=item['ground_truth'], 
+                        retrieval_k=retrieval_k,
+                        final_k=final_k
+                    )
+                    return result
+                except Exception as e:
+                    print(f"❌ Error processing query '{item['query'][:50]}...': {e}")
+                    return {
+                        'error': str(e),
+                        'query': item['query'],
+                        'ground_truth': item['ground_truth']
+                    }
         
-        for i, data in enumerate(evaluation_data):
-            print(f"\nProcessing query {i+1}/{len(evaluation_data)}")
-
-            # print(data.get('query'))
-            # print(data.get('ground_truth'))
-            # print(data.get('generated_response'))
-            # print(data.get('context'))
-
-            result = self.llm_judge.judge_response(
-                generated_response=data.get('generated_response'),
-                ground_truth=data.get('ground_truth'),
-                query=data.get('query'),
-                context=data.get('context')
-            )
-
-            # print(result.confidence_score)
-            # print(result.final_assessment)
-            results.append(result)
-
-        return results
-    
-    def get_pipeline_info(self) -> Dict[str, Any]:
-        """
-        Get information about the current pipeline configuration
+        # Execute all tasks concurrently
+        tasks = [process_with_semaphore(item) for item in dataset]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        Returns:
-            Dictionary containing pipeline information
-        """
-        info = {
-            'is_ready': self.is_ready,
-            'generation_model': self.generator.model,
-            'temperature': self.generator.temperature,
-            'default_k': self.reranker.default_k,
-            'judge_model': self.llm_judge.judge_model,
-            'judge_confidence_threshold': self.llm_judge.confidence_threshold,
-        }
+        # Handle any exceptions
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                processed_results.append({
+                    'error': str(result),
+                    'query': dataset[i]['query'],
+                    'ground_truth': dataset[i]['ground_truth']
+                })
+            else:
+                processed_results.append(result)
         
-        if self.is_ready:
-            info.update({
-                'num_chunks': len(self.preprocessor.chunks),
-                'chunk_size': self.preprocessor.chunk_size,
-                'chunk_overlap': self.preprocessor.chunk_overlap,
-                'index_size': self.preprocessor.faiss_index.ntotal if self.preprocessor.faiss_index else 0
-            })
+        total_time = time.time() - start_time
+        success_count = sum(1 for r in processed_results if 'error' not in r)
         
-        return info
-
+        print(f"✅ Async processing complete: {success_count}/{len(dataset)} successful in {total_time:.2f}s")
+        print(f"📊 Throughput: {len(dataset)/total_time:.2f} queries/second")
+        
+        return processed_results
 
 def create_pipeline_from_config(config_path: Optional[str] = None) -> RAGPipeline:
     """
@@ -251,16 +270,19 @@ def create_pipeline_from_config(config_path: Optional[str] = None) -> RAGPipelin
         load_dotenv()
     
     api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY not found in environment variables")
+    langfuse_public = os.getenv('LANGFUSE_PUBLIC_KEY')
+    langfuse_secret = os.getenv('LANGFUSE_SECRET_KEY')
+    langfuse_host = os.getenv('LANGFUSE_HOST', 'https://cloud.langfuse.com')
+
+    if not api_key or not langfuse_public or not langfuse_secret:
+        raise ValueError("OPENAI_API_KEY, LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY must be set in environment variables")
     
     # Get optional configuration parameters
     chunk_size = int(os.getenv('CHUNK_SIZE', 500))
     chunk_overlap = int(os.getenv('CHUNK_OVERLAP', 50))
+    retrieval_method = os.getenv('RETRIEVAL_METHOD', 'hybrid')
     model = os.getenv('GENERATION_MODEL', 'gpt-4o-mini')
     temperature = float(os.getenv('TEMPERATURE', 0.1))
-    judge_model = os.getenv('JUDGE_MODEL', 'gpt-4o-mini')
-    judge_threshold = float(os.getenv('JUDGE_CONFIDENCE_THRESHOLD', 0.8))
     
     return RAGPipeline(
         openai_api_key=api_key,
@@ -268,6 +290,5 @@ def create_pipeline_from_config(config_path: Optional[str] = None) -> RAGPipelin
         chunk_overlap=chunk_overlap,
         generation_model=model,
         temperature=temperature,
-        judge_model=judge_model,
-        judge_confidence_threshold=judge_threshold
+        retrieval_method=retrieval_method
     )

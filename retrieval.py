@@ -16,8 +16,8 @@ from collections import defaultdict
 
 class RetrievalMethod(Enum):
     """Enumeration of available retrieval methods"""
-    BM25_ONLY = "bm25_only"
-    DENSE_ONLY = "dense_only"
+    BM25_ONLY = "bm25"
+    DENSE_ONLY = "dense"
     HYBRID = "hybrid"
 
 

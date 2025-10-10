@@ -71,7 +71,6 @@ result = pipeline.query(
     query="What was the revenue for Q1 2023?",
     retrieval_k=10,
     final_k=5,
-    use_financial_prompt=True
 )
 
 print(result['response'])
@@ -158,7 +157,6 @@ Query parameters:
 - `remove_duplicates`: Enable deduplication
 - `filter_length`: Enable length filtering
 - `diversify`: Enable source diversification
-- `use_financial_prompt`: Use domain-specific prompting
 
 ## Evaluation
 

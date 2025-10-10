@@ -7,6 +7,7 @@ import os
 from datasets import load_dataset
 from typing import List, Dict, Any
 import pandas as pd
+import asyncio
 
 from rag_pipeline import create_pipeline_from_config
 
@@ -32,34 +33,27 @@ def load_financebench_data(split: str = "train", max_samples: int = 50) -> tuple
         dataset = dataset.select(range(max_samples))
     
     print(f"Loaded {len(dataset)} samples from FinanceBench")
-    
-    # Extract unique documents from the dataset
+
+
+    evaluation_queries = []
     documents = []
     
-    evaluation_queries = []
-    
     for item in dataset:
-        # Extract document text (assuming 'evidence' contains the document text)
-        if 'evidence' in item and item['evidence']:
-            evidence = item['evidence']
-            for doc_text in evidence:  # Avoid duplicates
-                documents.append(
-                    {
-                        'text': doc_text['evidence_text_full_page'],
-                    }
-                )
-        
-        # Extract query and answer for evaluation
-        if 'question' in item and 'answer' in item:
-            evaluation_queries.append({
-                'query': item['question'],
-                'ground_truth': item['answer']
+        evidence = item['evidence']
+        for doc_text in evidence:  # Avoid duplicates
+            documents.append({
+                'text': doc_text['evidence_text_full_page']
             })
+        
+        evaluation_queries.append({
+            'query': item['question'],
+            'ground_truth': item['answer']
+        })
+            
 
+    print(f"Extracted {len(evaluation_queries)} evaluation queries and {len(documents)} documents")
     
-    print(f"Extracted {len(documents)} unique documents and {len(evaluation_queries)} evaluation queries")
-    
-    return documents, evaluation_queries
+    return evaluation_queries, documents
 
 
 def run_basic_demo():
@@ -69,17 +63,17 @@ def run_basic_demo():
     print("=== RAG Pipeline Demo with FinanceBench Dataset ===\n")
     
     # Load data
-    documents, evaluation_queries = load_financebench_data(max_samples=20)
+    evaluation_queries, documents = load_financebench_data(max_samples=20)
     
     # Create and setup pipeline
     print("Setting up RAG pipeline...")
     pipeline = create_pipeline_from_config()
     
     # Process documents
-    pipeline.load_and_process_documents(documents)
+    # pipeline.load_and_process_documents(documents)
     
     # Save index for future use
-    pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
+    # pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
     
     # Demo with a few sample queries
     print("\n=== Running Sample Queries ===")
@@ -99,96 +93,74 @@ def run_basic_demo():
         print(f"Average similarity: {result['retrieval_stats']['avg_similarity']:.3f}")
 
 
-def run_evaluation_demo():
+async def run_evaluation_demo():
     """
     Run evaluation demonstration
     """
     print("\n=== RAG Pipeline Evaluation Demo ===\n")
     
     # Load data
-    documents, evaluation_queries = load_financebench_data(max_samples=10)
+    evaluation_queries, documents = load_financebench_data(max_samples=10)
     
     # Create and setup pipeline
     pipeline = create_pipeline_from_config()
+
+    # Process documents
+    pipeline.load_and_process_documents(documents)
     
+    # Save index for future use
+    pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
+    
+    result = await pipeline.batch_query(evaluation_queries, retrieval_k=10, final_k=5)
+    for r in result:
+        print('result', r)
     # Try to load existing index, otherwise create new one
-    try:
-        pipeline.load_from_saved_index("financebench_index.faiss", "financebench_metadata.pkl")
-        print("Loaded existing index")
-    except:
-        print("Creating new index...")
-        pipeline.load_and_process_documents(documents)
-        pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
-    
-    # Run evaluation on subset of queries
-    eval_llm_gen_data = []
-    for query_data in evaluation_queries[:5]:
-        result = pipeline.query(query=query_data['query'])
-        eval_llm_gen_data.append({
-            'query': query_data['query'],
-            'ground_truth': query_data['ground_truth'],
-            'generated_response': result['response'],
-            'context': result['processed_chunks']
-        })
-    
-    print(f"Running evaluation on {len(eval_llm_gen_data)} queries...")
-    batch_results = pipeline.batch_judge(eval_llm_gen_data)
-    
-    # Display results
-    print("\n=== Evaluation Results ===")    
-    print("\nIndividual Query Results:")
-    for i, result in enumerate(batch_results):
-        final_eval = result.final_assessment
-        confidence = result.confidence_score
-        status = "✅" if final_eval else "❌"
-
-        print(f"   Result: {'PASS' if final_eval else 'FAIL'} (Confidence: {confidence:.3f})")
     
 
-def interactive_demo():
-    """
-    Interactive demo allowing user to ask custom questions
-    """
-    print("\n=== Interactive RAG Demo ===")
-    print("Ask financial questions and see how the RAG pipeline responds!")
-    print("Type 'quit' to exit.\n")
+# def interactive_demo():
+#     """
+#     Interactive demo allowing user to ask custom questions
+#     """
+#     print("\n=== Interactive RAG Demo ===")
+#     print("Ask financial questions and see how the RAG pipeline responds!")
+#     print("Type 'quit' to exit.\n")
     
-    # Setup pipeline
-    try:
-        pipeline = create_pipeline_from_config()
-        pipeline.load_from_saved_index("financebench_index.faiss", "financebench_metadata.pkl")
-        print("Loaded existing FinanceBench index")
-    except:
-        print("No existing index found. Loading sample data...")
-        documents, _ = load_financebench_data(max_samples=20)
-        pipeline = create_pipeline_from_config()
-        pipeline.load_and_process_documents(documents)
-        pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
+#     # Setup pipeline
+#     try:
+#         pipeline = create_pipeline_from_config()
+#         pipeline.load_from_saved_index("financebench_index.faiss", "financebench_metadata.pkl")
+#         print("Loaded existing FinanceBench index")
+#     except:
+#         print("No existing index found. Loading sample data...")
+#         documents, _ = load_financebench_data(max_samples=20)
+#         pipeline = create_pipeline_from_config()
+#         pipeline.load_and_process_documents(documents)
+#         pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
     
-    print("Pipeline ready! Ask your questions:\n")
+#     print("Pipeline ready! Ask your questions:\n")
     
-    while True:
-        query = input("Your question: ").strip()
+#     while True:
+#         query = input("Your question: ").strip()
         
-        if query.lower() in ['quit', 'exit', 'q']:
-            print("Thanks for using the RAG pipeline demo!")
-            break
+#         if query.lower() in ['quit', 'exit', 'q']:
+#             print("Thanks for using the RAG pipeline demo!")
+#             break
         
-        if not query:
-            print("Please enter a question or 'quit' to exit.")
-            continue
+#         if not query:
+#             print("Please enter a question or 'quit' to exit.")
+#             continue
         
-        try:
-            result = pipeline.query(query=query)
+#         try:
+#             result = pipeline.query(query=query)
              
             
-            print(f"\nAnswer: {result['response']}")
-            print(f"(Based on {result['retrieval_stats']['final_processed']} relevant document chunks)")
-            print("-" * 80)
+#             print(f"\nAnswer: {result['response']}")
+#             print(f"(Based on {result['retrieval_stats']['final_processed']} relevant document chunks)")
+#             print("-" * 80)
             
-        except Exception as e:
-            print(f"Error processing query: {e}")
-            print("-" * 80)
+#         except Exception as e:
+#             print(f"Error processing query: {e}")
+#             print("-" * 80)
 
 
 def main():
@@ -213,7 +185,7 @@ def main():
     if args.demo == "basic":
         run_basic_demo()
     elif args.demo == "eval":
-        run_evaluation_demo()
+        asyncio.run(run_evaluation_demo())
     elif args.demo == "interactive":
         interactive_demo()
     
