@@ -17,13 +17,14 @@ from generation import ResponseGenerator
 from evaluation import Evaluator
 from langfuse import get_client
 
+
 class RAGPipeline:
     """
     Complete RAG Pipeline integrating all components for end-to-end functionality
     """
     
     def __init__(self, openai_api_key: str, 
-                 chunk_size: int = 500, 
+                 chunk_size: int = 600, 
                  chunk_overlap: int = 50,
                  generation_model: str = "gpt-4o-mini",
                  temperature: float = 0,
@@ -40,8 +41,25 @@ class RAGPipeline:
         """
         self.api_key = openai_api_key
         
-        # Initialize all components
-        self.preprocessor = DocumentPreprocessor(openai_api_key, chunk_size, chunk_overlap)
+        # Determine retrieval method and required indices
+        if retrieval_method == "hybrid":
+            self.retrieval_method = RetrievalMethod.HYBRID
+            retrieval_methods = ["bm25", "dense"]
+        elif retrieval_method == "bm25":
+            self.retrieval_method = RetrievalMethod.BM25_ONLY
+            retrieval_methods = ["bm25"]
+        elif retrieval_method == "dense":
+            self.retrieval_method = RetrievalMethod.DENSE_ONLY
+            retrieval_methods = ["dense"]
+        else:
+            raise ValueError(f"Invalid retrieval method: {retrieval_method}")
+        
+        # Initialize all components with retrieval method info
+        self.preprocessor = DocumentPreprocessor(
+            openai_api_key, 
+            chunk_size, 
+            chunk_overlap
+        )
         self.retriever = None  # Will be initialized after preprocessing
         self.reranker = Reranker(default_k=5)
         self.generator = ResponseGenerator(openai_api_key, generation_model, temperature)
@@ -49,15 +67,6 @@ class RAGPipeline:
         self.is_ready = False
 
         self.langfuse_context = get_client()
-
-        if retrieval_method == "hybrid":
-            self.retrieval_method = RetrievalMethod.HYBRID
-        elif retrieval_method == "bm25":
-            self.retrieval_method = RetrievalMethod.BM25_ONLY
-        elif retrieval_method == "dense":
-            self.retrieval_method = RetrievalMethod.DENSE_ONLY
-        else:
-            raise ValueError(f"Invalid retrieval method: {retrieval_method}")
     
     def load_and_process_documents(self, documents: List[Dict[str, Any]]) -> None:
         """
@@ -111,8 +120,8 @@ class RAGPipeline:
     
     async def query_with_eval(self, query: str, 
             ground_truth: str,
-            retrieval_k: int = 10,
-            final_k: int = 5,
+            retrieval_k: int = 20,
+            final_k: int = 10,
             ) -> Dict[str, Any]:
         """
         Process a query through the complete RAG pipeline
@@ -194,7 +203,7 @@ class RAGPipeline:
         return evaluation_scores
 
     async def batch_query(self, dataset: List[Dict[str, str]], 
-                               retrieval_k: int = 10, final_k: int = 5,
+                               retrieval_k: int = 20, final_k: int = 10,
                                max_concurrent: int = 5) -> List[Dict[str, Any]]:
         """
         Process large datasets using asyncio concurrency (BEST for API-heavy workloads)
@@ -253,7 +262,7 @@ class RAGPipeline:
         
         return processed_results
 
-def create_pipeline_from_config(config_path: Optional[str] = None) -> RAGPipeline:
+def create_pipeline_from_config(**kwargs) -> RAGPipeline:
     """
     Create a RAG pipeline from configuration file or environment variables
     
@@ -264,31 +273,13 @@ def create_pipeline_from_config(config_path: Optional[str] = None) -> RAGPipelin
         Initialized RAGPipeline instance
     """
     # Load environment variables
-    if config_path:
-        load_dotenv(config_path)
-    else:
-        load_dotenv()
+    load_dotenv()
     
     api_key = os.getenv('OPENAI_API_KEY')
-    langfuse_public = os.getenv('LANGFUSE_PUBLIC_KEY')
-    langfuse_secret = os.getenv('LANGFUSE_SECRET_KEY')
-    langfuse_host = os.getenv('LANGFUSE_HOST', 'https://cloud.langfuse.com')
-
-    if not api_key or not langfuse_public or not langfuse_secret:
-        raise ValueError("OPENAI_API_KEY, LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY must be set in environment variables")
-    
-    # Get optional configuration parameters
-    chunk_size = int(os.getenv('CHUNK_SIZE', 500))
-    chunk_overlap = int(os.getenv('CHUNK_OVERLAP', 50))
-    retrieval_method = os.getenv('RETRIEVAL_METHOD', 'hybrid')
-    model = os.getenv('GENERATION_MODEL', 'gpt-4o-mini')
-    temperature = float(os.getenv('TEMPERATURE', 0.1))
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY must be set in environment variables")
     
     return RAGPipeline(
         openai_api_key=api_key,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        generation_model=model,
-        temperature=temperature,
-        retrieval_method=retrieval_method
+        **kwargs
     )

@@ -36,44 +36,6 @@ class Retriever:
         """
         self.preprocessor = preprocessor
         self.client = OpenAI(api_key=openai_api_key)
-
-        # BM25 components
-        self.bm25_corpus = None
-        self.bm25_index = None
-
-        if self.preprocessor.chunks:
-            self._build_bm25_index()
-
-    def _build_bm25_index(self):
-        """Build BM25 index from preprocessed chunks"""
-        print("Building BM25 index...")
-        
-        # Tokenize all chunks for BM25
-        self.bm25_corpus = []
-        for chunk in self.preprocessor.chunks:
-            tokens = self._tokenize_text(chunk)
-            self.bm25_corpus.append(tokens)
-        
-        # Create BM25 index
-        self.bm25_index = BM25Okapi(self.bm25_corpus)
-        print(f"BM25 index built with {len(self.bm25_corpus)} documents")
-    
-    def _tokenize_text(self, text: str) -> List[str]:
-        """
-        Simple tokenization for BM25
-        
-        Args:
-            text: Input text to tokenize
-            
-        Returns:
-            List of tokens
-        """
-        # Convert to lowercase and split on whitespace and punctuation
-        text = re.sub(r'[^\w\s]', ' ', text.lower())
-        tokens = text.split()
-        # Remove very short tokens
-        tokens = [token for token in tokens if len(token) > 2]
-        return tokens
     
     def embed_query(self, query: str) -> List[float]:
         """
@@ -106,29 +68,39 @@ class Retriever:
         Returns:
             List of retrieved chunks with metadata and similarity scores
         """
-        if self.bm25_index is None:
-            raise ValueError("BM25 index not built. Please build the index first.")
+        if self.preprocessor.bm25_index is None:
+            raise ValueError("BM25 index not loaded. Please load or create an index first.")
 
-        query_tokens = self._tokenize_text(query)
+        contextual_bm25_used = getattr(self.preprocessor, 'use_contextual_retrieval', False)
+        method_name = "contextual_bm25" if contextual_bm25_used else "standard_bm25"
 
-        bm25_scores = self.bm25_index.get_scores(query_tokens)
+        if contextual_bm25_used:
+            print("🎯 Using Contextual BM25")
 
+        query_tokens = self.preprocessor.tokenize_text(query)
+        bm25_scores = self.preprocessor.bm25_index.get_scores(query_tokens)
         top_indices = np.argsort(bm25_scores)[::-1][:max_candidates]
 
         retrieved_chunks = []
-
-        for i, idx in enumerate(top_indices):
+        for rank, idx in enumerate(top_indices):
             if idx < len(self.preprocessor.chunks) and bm25_scores[idx] > 0:
                 chunk_data = {
-                    'rank': i + 1,
-                    'chunk_text': self.preprocessor.chunks[idx],
+                    'rank': rank + 1,
+                    'chunk_text': (self.preprocessor.contextualized_chunks[idx] 
+               if getattr(self.preprocessor, 'contextualized_chunks', None) 
+               else self.preprocessor.chunks[idx]),
                     'similarity_score': float(bm25_scores[idx]),
                     'bm25_score': float(bm25_scores[idx]),
                     'dense_score': 0.0,  # No dense score for BM25-only
                     'chunk_metadata': self.preprocessor.chunk_metadata[idx],
                     'chunk_index': int(idx),
-                    'retrieval_method': 'bm25_only'
+                    'retrieval_method': method_name,
+                    'contextual_retrieval_used': contextual_bm25_used
                 }
+
+                if getattr(self.preprocessor, 'contextualized_chunks', None):
+                    chunk_data['contextualized_chunk'] = self.preprocessor.contextualized_chunks[idx]
+                    chunk_data['has_context'] = self.preprocessor.chunks[idx] != self.preprocessor.contextualized_chunks[idx]
                 retrieved_chunks.append(chunk_data)
         
         return retrieved_chunks
@@ -156,130 +128,106 @@ class Retriever:
         
         # Perform similarity search
         similarities, indices = self.preprocessor.faiss_index.search(query_vector, max_candidates)
+        sims, indices = similarities[0], indices[0]
+
+        contextual_embeddings_used = getattr(self.preprocessor, 'use_contextual_retrieval', False)
+        method_name = "contextual_dense" if contextual_embeddings_used else "standard_dense"
+
+        if contextual_embeddings_used:
+            print("🎯 Using Contextual Dense Embeddings")
         
         # Prepare results
         retrieved_chunks = []
-        
-        for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
+        for rank, (sim, idx) in enumerate(zip(sims, indices)):
             if idx < len(self.preprocessor.chunks):
                 chunk_data = {
-                    'rank': i + 1,
-                    'chunk_text': self.preprocessor.chunks[idx],
-                    'similarity_score': float(similarity),
-                    'dense_score': float(similarity),
+                    'rank': rank + 1,
+                    'chunk_text': (self.preprocessor.contextualized_chunks[idx] 
+               if getattr(self.preprocessor, 'contextualized_chunks', None) 
+               else self.preprocessor.chunks[idx]),
+                    'similarity_score': float(sim),
+                    'dense_score': float(sim),
                     'bm25_score': 0.0,  # No BM25 score for dense-only
                     'chunk_metadata': self.preprocessor.chunk_metadata[idx],
                     'chunk_index': int(idx),
-                    'retrieval_method': 'dense_only'
+                    'retrieval_method': method_name,
+                    'contextual_retrieval_used': contextual_embeddings_used
                 }
+
+                if getattr(self.preprocessor, 'contextualized_chunks', None):
+                    chunk_data['contextualized_chunk'] = self.preprocessor.contextualized_chunks[idx]
+                    chunk_data['has_context'] = self.preprocessor.chunks[idx] != self.preprocessor.contextualized_chunks[idx]
                 retrieved_chunks.append(chunk_data)
         
         return retrieved_chunks
 
-    def retrieve_hybrid(self, query: str, k: int = 20, 
-                       bm25_weight: float = 0.3, 
-                       dense_weight: float = 0.7,
-                       bm25_k: int = 50,
-                       dense_k: int = 50) -> List[Dict[str, Any]]:
+    def retrieve_hybrid(self, query: str,
+                        k: int = 20, 
+                        rrf_k: int = 50,
+                        max_candidates: int = 20) -> List[Dict[str, Any]]:
         """
         Retrieve using hybrid approach (BM25 + Dense)
         
         Args:
             query: Query string
             k: Final number of chunks to return
-            bm25_weight: Weight for BM25 scores (0.0 to 1.0)
-            dense_weight: Weight for dense scores (0.0 to 1.0)
+            rrf_k: Number of candidates to retrieve from BM25 and dense
             bm25_k: Number of candidates to retrieve from BM25
-            dense_k: Number of candidates to retrieve from dense
             
         Returns:
             List of retrieved chunks with hybrid scores
         """
         # Get candidates from both methods
-        bm25_results = self.retrieve_bm25(query, bm25_k)
-        dense_results = self.retrieve_dense(query, dense_k)
+        bm25_results = self.retrieve_bm25(query, max_candidates)
+        bm25_scores = np.zeros(len(self.preprocessor.chunks))
+        bm25_ranks = np.full(len(self.preprocessor.chunks), np.inf)
+        for rank, item in enumerate(bm25_results):
+            idx = item['chunk_index']
+            bm25_scores[idx] = item['bm25_score']
+            bm25_ranks[idx] = rank
+
+        dense_results = self.retrieve_dense(query, max_candidates)
+        dense_scores = np.zeros(len(self.preprocessor.chunks))
+        dense_ranks = np.full(len(self.preprocessor.chunks), np.inf)
+        for rank, item in enumerate(dense_results):
+            idx = item['chunk_index']
+            dense_scores[idx] = item['dense_score']
+            dense_ranks[idx] = rank
         
-        # Normalize scores to [0, 1] range
-        bm25_scores_norm = self._normalize_scores([r['bm25_score'] for r in bm25_results])
-        dense_scores_norm = self._normalize_scores([r['dense_score'] for r in dense_results])
+        rrf_scores = np.zeros(len(self.preprocessor.chunks))
+        for idx in range(len(self.preprocessor.chunks)):
+            if bm25_ranks[idx] < np.inf:
+                rrf_scores[idx] += 1 / (rrf_k + bm25_ranks[idx] + 1)
+            if dense_ranks[idx] < np.inf:
+                rrf_scores[idx] += 1 / (rrf_k + dense_ranks[idx] + 1)
+
+        top_indices = np.argsort(-rrf_scores)[:k]
+
+        results = []
+        for rank, idx in enumerate(top_indices):
+            if rrf_scores[idx] == 0:
+                continue
+            # max_rrf = max(rrf_scores[rrf_scores > 0])
+            rrf_score_normalized = rrf_scores[idx]
+            chunk_data = {
+                'rank': rank + 1,
+                'chunk_text': (self.preprocessor.contextualized_chunks[idx] 
+               if getattr(self.preprocessor, 'contextualized_chunks', None) 
+               else self.preprocessor.chunks[idx]),
+                'similarity_score': rrf_score_normalized,
+                'bm25_score': float(bm25_scores[idx]),
+                'dense_score': float(dense_scores[idx]),
+                'chunk_metadata': self.preprocessor.chunk_metadata[idx],
+                'chunk_index': int(idx),
+                'retrieval_method': "hybrid_rrf",
+                'contextual_retrieval_used': getattr(self.preprocessor, 'use_contextual_retrieval', False)
+            }
+            if getattr(self.preprocessor, 'contextualized_chunks', None):
+                chunk_data['contextualized_chunk'] = self.preprocessor.contextualized_chunks[idx]
+                chunk_data['has_context'] = self.preprocessor.chunks[idx] != self.preprocessor.contextualized_chunks[idx]
+            results.append(chunk_data)
         
-        # Update normalized scores
-        for i, result in enumerate(bm25_results):
-            result['bm25_score_norm'] = bm25_scores_norm[i] if i < len(bm25_scores_norm) else 0.0
-        
-        for i, result in enumerate(dense_results):
-            result['dense_score_norm'] = dense_scores_norm[i] if i < len(dense_scores_norm) else 0.0
-        
-        # Combine results and calculate hybrid scores
-        chunk_scores = defaultdict(lambda: {'bm25_score': 0.0, 'dense_score': 0.0, 'bm25_score_norm': 0.0, 'dense_score_norm': 0.0, 'chunk_data': None})
-        
-        # Add BM25 results
-        for result in bm25_results:
-            idx = result['chunk_index']
-            chunk_scores[idx]['bm25_score'] = result['bm25_score']
-            chunk_scores[idx]['bm25_score_norm'] = result.get('bm25_score_norm', 0.0)
-            chunk_scores[idx]['chunk_data'] = result
-        
-        # Add dense results
-        for result in dense_results:
-            idx = result['chunk_index']
-            chunk_scores[idx]['dense_score'] = result['dense_score']
-            chunk_scores[idx]['dense_score_norm'] = result.get('dense_score_norm', 0.0)
-            if chunk_scores[idx]['chunk_data'] is None:
-                chunk_scores[idx]['chunk_data'] = result
-        
-        # Calculate hybrid scores and create final results
-        hybrid_results = []
-        
-        for idx, scores in chunk_scores.items():
-            # Calculate hybrid score using normalized scores
-            hybrid_score = (bm25_weight * scores['bm25_score_norm'] + 
-                          dense_weight * scores['dense_score_norm'])
-            
-            chunk_data = scores['chunk_data'].copy()
-            chunk_data.update({
-                'similarity_score': hybrid_score,
-                'hybrid_score': hybrid_score,
-                'bm25_score': scores['bm25_score'],
-                'dense_score': scores['dense_score'],
-                'bm25_score_norm': scores['bm25_score_norm'],
-                'dense_score_norm': scores['dense_score_norm'],
-                'bm25_weight': bm25_weight,
-                'dense_weight': dense_weight,
-                'retrieval_method': 'hybrid'
-            })
-            
-            hybrid_results.append(chunk_data)
-        
-        # Sort by hybrid score and return top k
-        hybrid_results.sort(key=lambda x: x['hybrid_score'], reverse=True)
-        
-        # Update ranks
-        for i, result in enumerate(hybrid_results[:k]):
-            result['rank'] = i + 1
-        
-        return hybrid_results[:k]
-    
-    def _normalize_scores(self, scores: List[float]) -> List[float]:
-        """
-        Normalize scores to [0, 1] range using min-max normalization
-        
-        Args:
-            scores: List of scores to normalize
-            
-        Returns:
-            List of normalized scores
-        """
-        if not scores:
-            return scores
-        
-        min_score = min(scores)
-        max_score = max(scores)
-        
-        if max_score == min_score:
-            return [1.0] * len(scores)  # All scores are the same
-        
-        return [(score - min_score) / (max_score - min_score) for score in scores]
+        return results
     
     def retrieve(self, query: str, k: int = 20, 
                 method: Optional[RetrievalMethod] = None,
@@ -296,7 +244,6 @@ class Retriever:
         Returns:
             List of retrieved chunks
         """
-        method = method or self.default_method
         
         print(f"Retrieving with method: {method.value}")
         

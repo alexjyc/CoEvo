@@ -86,12 +86,12 @@ async def demo_batch_evaluation():
     pipeline = create_pipeline_from_config()
     
     # Use existing saved index if available
-    try:
-        pipeline.load_from_saved_index("financebench_index.faiss", "financebench_metadata.pkl")
-        print("✅ Loaded existing FinanceBench index")
-    except:
-        print("⚠️  No existing index found. Please run basic setup first.")
-        return
+    # try:
+    #     pipeline.load_from_saved_index("financebench_index.faiss", "financebench_metadata.pkl")
+    #     print("✅ Loaded existing FinanceBench index")
+    # except:
+    #     print("⚠️  No existing index found. Please run basic setup first.")
+    #     return
     
     # Batch evaluation data
     evaluation_data = [

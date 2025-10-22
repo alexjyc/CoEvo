@@ -103,7 +103,7 @@ async def run_evaluation_demo():
     evaluation_queries, documents = load_financebench_data(max_samples=10)
     
     # Create and setup pipeline
-    pipeline = create_pipeline_from_config()
+    pipeline = create_pipeline_from_config(retrieval_method="hybrid")
 
     # Process documents
     pipeline.load_and_process_documents(documents)
@@ -111,7 +111,7 @@ async def run_evaluation_demo():
     # Save index for future use
     pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
     
-    result = await pipeline.batch_query(evaluation_queries, retrieval_k=10, final_k=5)
+    result = await pipeline.batch_query(evaluation_queries, retrieval_k=20, final_k=10)
     for r in result:
         print('result', r)
     # Try to load existing index, otherwise create new one
