@@ -3,10 +3,8 @@ Demo script for RAG Pipeline using FinanceBench Dataset
 Demonstrates the complete workflow from data loading to evaluation
 """
 
-import os
 from datasets import load_dataset
 from typing import List, Dict, Any
-import pandas as pd
 import asyncio
 
 from rag_pipeline import create_pipeline_from_config
@@ -31,7 +29,7 @@ def load_financebench_data(split: str = "train", max_samples: int = 50) -> tuple
     # Limit samples for demo purposes
     if max_samples and len(dataset) > max_samples:
         dataset = dataset.select(range(max_samples))
-    
+        
     print(f"Loaded {len(dataset)} samples from FinanceBench")
 
 
@@ -93,7 +91,7 @@ def run_basic_demo():
         print(f"Average similarity: {result['retrieval_stats']['avg_similarity']:.3f}")
 
 
-async def run_evaluation_demo():
+async def run_evaluation_demo(retrieval_method: str = "hybrid", use_context: bool = True):
     """
     Run evaluation demonstration
     """
@@ -103,17 +101,32 @@ async def run_evaluation_demo():
     evaluation_queries, documents = load_financebench_data(max_samples=10)
     
     # Create and setup pipeline
-    pipeline = create_pipeline_from_config(retrieval_method="hybrid")
+    pipeline = create_pipeline_from_config(retrieval_method=retrieval_method)
 
     # Process documents
-    pipeline.load_and_process_documents(documents)
+    pipeline.load_and_process_documents(documents, use_context=use_context)
     
     # Save index for future use
-    pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl")
+    pipeline.save_index("financebench_index.faiss", "financebench_metadata.pkl", use_context=use_context)
     
     result = await pipeline.batch_query(evaluation_queries, retrieval_k=20, final_k=10)
+
+    total, avg_metrics = 0, {}
     for r in result:
-        print('result', r)
+        total += 1
+        for metric, value in r.items():
+            if metric not in avg_metrics:
+                avg_metrics[metric] = []
+            avg_metrics[metric].append(value)
+
+    for metric, values in avg_metrics.items():
+        avg_metrics[metric] = sum(values) / total
+
+    print(f"Average metrics: {avg_metrics}")
+
+    return avg_metrics
+
+
     # Try to load existing index, otherwise create new one
     
 
@@ -172,6 +185,12 @@ def main():
     parser = argparse.ArgumentParser(description="RAG Pipeline Demo with FinanceBench")
     parser.add_argument("--demo", choices=["basic", "eval", "interactive"], 
                        default="basic", help="Type of demo to run")
+    parser.add_argument("--retrieval-method", choices=["bm25", "dense", "hybrid"],
+                       default="hybrid", help="Retrieval method to use")
+    parser.add_argument("--use-context", action="store_true", default=True,
+                       help="Use context in evaluation (default: True)")
+    parser.add_argument("--no-context", dest="use_context", action="store_false",
+                       help="Don't use context in evaluation")
     
     args = parser.parse_args()
     
@@ -185,9 +204,12 @@ def main():
     if args.demo == "basic":
         run_basic_demo()
     elif args.demo == "eval":
-        asyncio.run(run_evaluation_demo())
-    elif args.demo == "interactive":
-        interactive_demo()
+        asyncio.run(run_evaluation_demo(
+            retrieval_method=args.retrieval_method,
+            use_context=args.use_context,
+        ))
+    # elif args.demo == "interactive":
+    #     interactive_demo()
     
     print("\nDemo completed!")
 

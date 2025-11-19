@@ -3,9 +3,9 @@ Generation Module for RAG Pipeline
 Handles LLM integration for response generation using retrieved context
 """
 
+import os
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
-import json
 
 
 class ResponseGenerator:
@@ -13,7 +13,7 @@ class ResponseGenerator:
     Handles response generation using OpenAI's LLM with retrieved context
     """
     
-    def __init__(self, openai_api_key: str, model: str = "gpt-4o-mini", temperature: float = 0.1):
+    def __init__(self, model: str = "gpt-4o-mini", temperature: float = 0):
         """
         Initialize the response generator
         
@@ -22,7 +22,7 @@ class ResponseGenerator:
             model: OpenAI model to use for generation
             temperature: Generation temperature (lower = more deterministic)
         """
-        self.client = OpenAI(api_key=openai_api_key)
+        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         self.model = model
         self.temperature = temperature
     

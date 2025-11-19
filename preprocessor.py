@@ -6,16 +6,12 @@ Reference: https://www.anthropic.com/engineering/contextual-retrieval
 
 import os
 import numpy as np
-import pandas as pd
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import faiss
-import openai
 from openai import OpenAI
 from tqdm import tqdm
 import pickle
-import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 from rank_bm25 import BM25Okapi
 import re
 
@@ -25,11 +21,9 @@ class DocumentPreprocessor:
     Adds context to chunks before embedding to improve retrieval accuracy
     """
     
-    def __init__(self, 
-                 openai_api_key: str, 
-                 chunk_size: int = 600, 
-                 chunk_overlap: int = 50,
-                 use_contextual_retrieval: bool = True,
+    def __init__(self,  
+                 chunk_size: int = 500, 
+                 chunk_overlap: int = 80,
                  contextualizer_model: str = "gpt-4o-mini",
                  embedding_model: str = "text-embedding-3-small",
                  max_workers: int = 5):
@@ -40,18 +34,17 @@ class DocumentPreprocessor:
             openai_api_key: OpenAI API key for embedding generation and contextualization
             chunk_size: Size of each text chunk in characters
             chunk_overlap: Number of overlapping characters between chunks
-            use_contextual_retrieval: Whether to add contextual information to chunks
             contextualizer_model: OpenAI model for generating chunk context
             embedding_model: OpenAI model for generating embeddings
             max_workers: Maximum concurrent workers for contextualization
         """
-        self.client = OpenAI(api_key=openai_api_key)
+        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.use_contextual_retrieval = use_contextual_retrieval
         self.contextualizer_model = contextualizer_model
         self.embedding_model = embedding_model
         self.max_workers = max_workers
+        self.use_contextual_retrieval = False
 
         # Storage
         self.chunks = []
@@ -136,15 +129,14 @@ Please give a short succinct context to situate this chunk within the overall do
                     "content": self.contextualizer_prompt.format(
                         document=document,
                         chunk=chunk
-                    )
+                    ),
                 }
             ]
             
             response = self.client.chat.completions.create(
                 model=self.contextualizer_model,
                 messages=messages,
-                temperature=0,
-                max_tokens=150  # Limit context to ~100-150 tokens as per research
+                temperature=0
             )
             
             context = response.choices[0].message.content.strip()
@@ -209,7 +201,7 @@ Please give a short succinct context to situate this chunk within the overall do
             List of embedding vectors
         """
         embeddings = []
-        batch_size = 500  # OpenAI supports up to 2048 inputs per request
+        batch_size = 128  # OpenAI supports up to 2048 inputs per request
         
         print(f"Generating embeddings for {len(texts)} texts in batches of {batch_size}...")
         
@@ -248,7 +240,8 @@ Please give a short succinct context to situate this chunk within the overall do
 
         tokens = text.split()
 
-        tokens = [token for token in tokens if len(token) > 2]
+        tokens = [token for token in tokens if len(token) >= 2]
+        
         return tokens
 
     def create_bm25_index(self, chunks: List[str]) -> List[BM25Okapi]:
@@ -290,8 +283,7 @@ Please give a short succinct context to situate this chunk within the overall do
         
         return index
     
-    # TODO: fix process document cursor issue 
-    def process_documents(self, documents: List[Dict[str, Any]]) -> None:
+    def process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
         """
         Process documents with enhanced contextual retrieval pipeline
         
@@ -299,7 +291,8 @@ Please give a short succinct context to situate this chunk within the overall do
             documents: List of documents with 'text' field
         """
         print(f"Processing {len(documents)} documents with contextual retrieval...")
-        
+        self.use_contextual_retrieval = use_context
+
         # Extract and chunk all documents
         all_chunks = []
         all_contextualized_chunks = []
@@ -314,10 +307,8 @@ Please give a short succinct context to situate this chunk within the overall do
             chunks = self.chunk_text(text)
             
             # Generate contextual information if enabled
-            if self.use_contextual_retrieval and chunks:
+            if use_context and chunks:
                 contextualized_chunks = self.contextualize_chunks_parallel(chunks, text)
-            else:
-                contextualized_chunks = chunks
             
             # Store both original and contextualized chunks
             for chunk_idx, (chunk, contextualized_chunk) in enumerate(zip(chunks, contextualized_chunks)):
@@ -330,7 +321,7 @@ Please give a short succinct context to situate this chunk within the overall do
                     'original_doc': doc,
                     'original_chunk': chunk,
                     'contextualized_chunk': contextualized_chunk,
-                    'has_context': self.use_contextual_retrieval and (chunk != contextualized_chunk)
+                    'has_context': use_context
                 })
         
         # Store chunks and metadata
@@ -339,9 +330,10 @@ Please give a short succinct context to situate this chunk within the overall do
         self.chunk_metadata = chunk_metadata
         
         # Conditionally generate embeddings based on retrieval methods
-        embedding_input = all_contextualized_chunks if self.use_contextual_retrieval else all_chunks
-        bm25_input = all_contextualized_chunks if self.use_contextual_retrieval else all_chunks
-        print(f"Generating embeddings for {len(embedding_input)} {'contextualized ' if self.use_contextual_retrieval else ''}chunks...")
+        embedding_input = all_contextualized_chunks if use_context else all_chunks
+        bm25_input = all_chunks
+
+        print(f"Generating embeddings for {len(embedding_input)} {'contextualized ' if use_context else ''}chunks...")
         self.embeddings = self.generate_embeddings(embedding_input)
         
         print("Creating BM25 index...")
@@ -355,7 +347,7 @@ Please give a short succinct context to situate this chunk within the overall do
         #     contextual_chunks = sum(1 for meta in chunk_metadata if meta['has_context'])
         #     print(f"✅ Contextual Retrieval: {contextual_chunks}/{len(all_chunks)} chunks enhanced with context")
     
-    def save_index(self, index_path: str, metadata_path: str) -> None:
+    def save_index(self, index_path: str, metadata_path: str, use_context: bool = True) -> None:
         """
         Save the FAISS index and enhanced metadata to disk
         
@@ -368,7 +360,7 @@ Please give a short succinct context to situate this chunk within the overall do
             faiss.write_index(self.faiss_index, index_path)
             print(f"✅ FAISS index saved to {index_path}")
         else:
-            print(f"📊 No FAISS index to save (BM25-only mode)")
+            print("📊 No FAISS index to save (BM25-only mode)")
             
         # Always save metadata
         with open(metadata_path, 'wb') as f:
@@ -384,7 +376,7 @@ Please give a short succinct context to situate this chunk within the overall do
         
         print(f"✅ Metadata saved to {metadata_path}")
     
-    def load_index(self, index_path: str, metadata_path: str) -> None:
+    def load_index(self, index_path: str, metadata_path: str, use_context: bool = True) -> None:
         """
         Load the FAISS index and enhanced metadata from disk
         
@@ -399,11 +391,33 @@ Please give a short succinct context to situate this chunk within the overall do
             self.contextualized_chunks = data.get('contextualized_chunks', self.chunks)
             self.chunk_metadata = data['chunk_metadata']
             self.embeddings = data.get('embeddings', [])
-            self.use_contextual_retrieval = data.get('use_contextual_retrieval', False)
+            self.use_contextual_retrieval = data.get('use_contextual_retrieval', use_context)
             self.contextualizer_model = data.get('contextualizer_model', 'gpt-4o-mini')
             self.embedding_model = data.get('embedding_model', 'text-embedding-3-small')
-        
-        
+
+        if self.chunks:
+            # bm25_source = self.contextualized_chunks if (self.use_contextual_retrieval and self.contextualized_chunks) else self.chunks
+            # self.bm25_index = self.create_bm25_index(bm25_source)
+            self.bm25_index = self.create_bm25_index(self.chunks)
+        else:
+            self.bm25_index = None
+
+        self.faiss_index = None
+        try:
+            if os.path.exists(index_path):
+                self.faiss_index = faiss.read_index(index_path)
+        except Exception as e:
+            print(f"Error loading FAISS index from {index_path}: {e}")
+            self.faiss_index = None
+
+        if self.faiss_index is None and self.embeddings:
+            try:
+                self.faiss_index = self.create_faiss_index(self.embeddings)
+                print("⚠️ Recreated FAISS index from stored embeddings.")
+            except Exception as e:
+                print(f"Error recreating FAISS index from embeddings: {e}")
+                self.faiss_index = None
+
         # Print contextual retrieval info
         if hasattr(self, 'chunk_metadata') and self.chunk_metadata:
             contextual_chunks = sum(1 for meta in self.chunk_metadata if meta.get('has_context', False))

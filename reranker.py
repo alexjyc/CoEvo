@@ -1,225 +1,135 @@
-"""
-Reranker Module for RAG Pipeline  
-Handles top-k selection and prepares for future reranking implementation
-"""
-
-import numpy as np
 from typing import List, Dict, Any, Optional
-import re
+
+from sentence_transformers import CrossEncoder
 
 
 class Reranker:
-    """
-    Handles reranking of retrieved chunks including top-k selection
-    and preparation for future reranking capabilities
-    """
-    
-    def __init__(self, default_k: int = 5):
-        """
-        Initialize the Reranker
-        
-        Args:
-            default_k: Default number of top chunks to select
-        """
+    def __init__(
+        self,
+        model_name: str = "cross-encoder/ms-marco-MiniLM-L-12-v2",
+        default_k: int = 10,
+        device: str = "mps",
+        batch_size: int = 16,
+        fusion_rrf_k: int = 60,
+        hybrid_dense_weight: float = 0.7
+    ) -> None:
+        self.model_name = model_name
         self.default_k = default_k
-    
-    def select_top_k(self, retrieved_chunks: List[Dict[str, Any]], k: Optional[int] = None) -> List[Dict[str, Any]]:
+        self.batch_size = batch_size
+        self.model = CrossEncoder(model_name, device=device)
+        self.fusion_rrf_k = fusion_rrf_k
+        self.hybrid_dense_weight = self._sanitize_weight(hybrid_dense_weight)
+
+    @staticmethod
+    def _sanitize_weight(weight: float) -> float:
+        return max(0.0, min(1.0, float(weight)))
+
+    def rank_fusion(
+        self,
+        bm25_results: List[Dict[str, Any]],
+        dense_results: List[Dict[str, Any]],
+        k: int,
+        dense_weight: Optional[float] = None,
+        rrf_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Select top-k chunks based on similarity scores
-        
-        Args:
-            retrieved_chunks: List of retrieved chunks with similarity scores
-            k: Number of top chunks to select (uses default_k if None)
-            
-        Returns:
-            List of top-k chunks
+        Fuse BM25 and dense retrieval outputs using Reciprocal Rank Fusion (RRF).
         """
-        k = k or self.default_k
-        
-        # Sort by similarity score in descending order
-        sorted_chunks = sorted(
-            retrieved_chunks, 
-            key=lambda x: x['similarity_score'], 
-            reverse=True
+        bm25_results = bm25_results or []
+        dense_results = dense_results or []
+        if not bm25_results and not dense_results:
+            return []
+
+        weight = (
+            self._sanitize_weight(dense_weight)
+            if dense_weight is not None
+            else self.hybrid_dense_weight
         )
-        
-        return sorted_chunks[:k]
-    
-    def remove_duplicates(self, retrieved_chunks: List[Dict[str, Any]], 
-                         similarity_threshold: float = 0.9) -> List[Dict[str, Any]]:
-        """
-        Remove near-duplicate chunks based on text similarity
-        
-        Args:
-            retrieved_chunks: List of retrieved chunks
-            similarity_threshold: Threshold for considering chunks as duplicates
-            
-        Returns:
-            List of chunks with duplicates removed
-        """
+        rrf_k = rrf_k or self.fusion_rrf_k
+        bm25_weight = 1.0 - weight
+
+        bm25_ranks = {item["chunk_index"]: rank for rank, item in enumerate(bm25_results)}
+        dense_ranks = {item["chunk_index"]: rank for rank, item in enumerate(dense_results)}
+        candidate_indices = set(bm25_ranks) | set(dense_ranks)
+        if not candidate_indices:
+            return []
+
+        def rrf(rank: int, component_weight: float) -> float:
+            return component_weight / (rrf_k + rank + 1)
+
+        # Build consolidated candidate map
+        candidate_map: Dict[int, Dict[str, Any]] = {}
+        for source in (bm25_results, dense_results):
+            for item in source:
+                idx = item["chunk_index"]
+                if idx not in candidate_map:
+                    candidate_map[idx] = dict(item)
+                else:
+                    for key, value in item.items():
+                        candidate_map[idx].setdefault(key, value)
+
+        fusion_scores: Dict[int, float] = {}
+        for idx in candidate_indices:
+            score = 0.0
+            if idx in bm25_ranks:
+                score += rrf(bm25_ranks[idx], bm25_weight)
+            if idx in dense_ranks:
+                score += rrf(dense_ranks[idx], weight)
+            fusion_scores[idx] = score
+
+        max_score = max(fusion_scores.values()) if fusion_scores else 1.0
+
+        fused: List[Dict[str, Any]] = []
+        for idx, raw_score in fusion_scores.items():
+            candidate = dict(candidate_map[idx])  # copy to avoid mutating source
+            candidate["fusion_raw_score"] = raw_score
+            candidate["similarity_score"] = (
+                raw_score if max_score == 0 else raw_score / max_score
+            )
+            candidate["retrieval_method"] = "hybrid_rrf"
+            candidate["hybrid_sources"] = {
+                "bm25": idx in bm25_ranks,
+                "dense": idx in dense_ranks,
+            }
+            if idx in bm25_ranks:
+                candidate["bm25_rank"] = bm25_ranks[idx] + 1
+            if idx in dense_ranks:
+                candidate["dense_rank"] = dense_ranks[idx] + 1
+            fused.append(candidate)
+
+        fused.sort(key=lambda item: item["fusion_raw_score"], reverse=True)
+
+        limited = fused[:k]
+        for rank, item in enumerate(limited, start=1):
+            item["rank"] = rank
+
+        return limited
+
+    def process_chunks(
+        self,
+        retrieved_chunks: List[Dict[str, Any]],
+        k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         if not retrieved_chunks:
             return []
-        
-        unique_chunks = [retrieved_chunks[0]]  # Keep the first chunk
-        
-        for chunk in retrieved_chunks[1:]:
-            is_duplicate = False
-            current_text = chunk['chunk_text'].lower().strip()
-            
-            for unique_chunk in unique_chunks:
-                unique_text = unique_chunk['chunk_text'].lower().strip()
-                
-                # Simple text overlap similarity
-                overlap_ratio = self._calculate_text_overlap(current_text, unique_text)
-                
-                if overlap_ratio >= similarity_threshold:
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                unique_chunks.append(chunk)
-        
-        return unique_chunks
-    
-    def _calculate_text_overlap(self, text1: str, text2: str) -> float:
-        """
-        Calculate text overlap ratio between two strings
-        
-        Args:
-            text1: First text string
-            text2: Second text string
-            
-        Returns:
-            Overlap ratio between 0 and 1
-        """
-        if not text1 or not text2:
-            return 0.0
-        
-        # Simple word-based overlap calculation
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        intersection = words1.intersection(words2)
-        union = words1.union(words2)
-        
-        return len(intersection) / len(union) if union else 0.0
-    
-    def filter_by_length(self, retrieved_chunks: List[Dict[str, Any]], 
-                        min_length: int = 50, max_length: int = 1000) -> List[Dict[str, Any]]:
-        """
-        Filter chunks by text length to ensure quality
-        
-        Args:
-            retrieved_chunks: List of retrieved chunks
-            min_length: Minimum chunk length in characters
-            max_length: Maximum chunk length in characters
-            
-        Returns:
-            List of chunks within length bounds
-        """
-        filtered_chunks = []
-        
+
+        k = k or self.default_k
+        if k <= 0:
+            return []
+
+        pairs = []
         for chunk in retrieved_chunks:
-            text_length = len(chunk['chunk_text'])
-            if min_length <= text_length <= max_length:
-                filtered_chunks.append(chunk)
-        
-        return filtered_chunks
-    
-    def diversify_sources(self, retrieved_chunks: List[Dict[str, Any]], 
-                         max_per_document: int = 2) -> List[Dict[str, Any]]:
-        """
-        Diversify chunks to avoid over-representation from single documents
-        
-        Args:
-            retrieved_chunks: List of retrieved chunks
-            max_per_document: Maximum chunks allowed per source document
-            
-        Returns:
-            List of diversified chunks
-        """
-        doc_count = {}
-        diversified_chunks = []
-        
-        for chunk in retrieved_chunks:
-            doc_id = chunk['chunk_metadata']['doc_id']
-            current_count = doc_count.get(doc_id, 0)
-            
-            if current_count < max_per_document:
-                diversified_chunks.append(chunk)
-                doc_count[doc_id] = current_count + 1
-        
-        return diversified_chunks
-    
-    def process_chunks(self, retrieved_chunks: List[Dict[str, Any]], 
-                      k: Optional[int] = None,
-                      remove_duplicates: bool = True,
-                      filter_length: bool = True,
-                      diversify: bool = True,
-                      **kwargs) -> List[Dict[str, Any]]:
-        """
-        Main processing pipeline that applies all reranking steps
-        
-        Args:
-            retrieved_chunks: List of retrieved chunks
-            k: Number of final chunks to return
-            remove_duplicates: Whether to remove duplicate chunks
-            filter_length: Whether to filter by chunk length
-            diversify: Whether to diversify source documents
-            **kwargs: Additional parameters for specific processing steps
-            
-        Returns:
-            List of processed chunks ready for generation
-        """
-        processed_chunks = retrieved_chunks.copy()
-        
-        # Step 1: Remove duplicates if requested
-        if remove_duplicates:
-            duplicate_threshold = kwargs.get('duplicate_threshold', 0.95)
-            processed_chunks = self.remove_duplicates(processed_chunks, duplicate_threshold)
-        
-        # Step 2: Filter by length if requested
-        if filter_length:
-            min_length = kwargs.get('min_length', 50)
-            max_length = kwargs.get('max_length', 1000)
-            processed_chunks = self.filter_by_length(processed_chunks, min_length, max_length)
-        
-        # Step 3: Diversify sources if requested
-        if diversify:
-            max_per_doc = kwargs.get('max_per_document', 2)
-            processed_chunks = self.diversify_sources(processed_chunks, max_per_doc)
-        
-        # Step 4: Select top-k chunks
-        final_chunks = self.select_top_k(processed_chunks, k)
-        
-        return final_chunks
-    
-    def get_processing_stats(self, original_chunks: List[Dict[str, Any]], 
-                           processed_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Get statistics about the processing pipeline
-        
-        Args:
-            original_chunks: Original list of retrieved chunks
-            processed_chunks: Processed list of chunks
-            
-        Returns:
-            Dictionary containing processing statistics
-        """
-        original_docs = set(chunk['chunk_metadata']['doc_id'] for chunk in original_chunks)
-        processed_docs = set(chunk['chunk_metadata']['doc_id'] for chunk in processed_chunks)
-        
-        stats = {
-            'original_count': len(original_chunks),
-            'final_count': len(processed_chunks),
-            'reduction_ratio': 1 - (len(processed_chunks) / len(original_chunks)) if original_chunks else 0,
-            'original_doc_count': len(original_docs),
-            'final_doc_count': len(processed_docs),
-            'avg_similarity_original': np.mean([chunk['similarity_score'] for chunk in original_chunks]) if original_chunks else 0,
-            'avg_similarity_final': np.mean([chunk['similarity_score'] for chunk in processed_chunks]) if processed_chunks else 0
-        }
-        
-        return stats
+            query = chunk.get("query")
+            text = chunk.get("chunk_text")
+            pairs.append((query, text))
+
+        scores = self.model.predict(pairs, batch_size=self.batch_size)
+
+        scored_chunks = []
+        for chunk, score in zip(retrieved_chunks, scores):
+            annotated = dict(chunk)
+            annotated["cross_encoder_score"] = float(score)
+            scored_chunks.append(annotated)
+
+        scored_chunks.sort(key=lambda item: item["cross_encoder_score"], reverse=True)
+        return scored_chunks[:k]

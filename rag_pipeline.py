@@ -10,6 +10,7 @@ import time
 from dotenv import load_dotenv
 
 
+from LLMBase import LLMBase
 from preprocessor import DocumentPreprocessor
 from retrieval import Retriever, RetrievalMethod
 from reranker import Reranker
@@ -28,7 +29,8 @@ class RAGPipeline:
                  chunk_overlap: int = 50,
                  generation_model: str = "gpt-4o-mini",
                  temperature: float = 0,
-                 retrieval_method: str = "hybrid"):
+                 retrieval_method: str = "hybrid",
+                 hybrid_dense_weight: float = 0.7):
         """
         Initialize the complete RAG pipeline
         
@@ -38,37 +40,38 @@ class RAGPipeline:
             chunk_overlap: Overlap between chunks
             generation_model: OpenAI model for generation
             temperature: Generation temperature
+            cross_encoder_strategy: Optional reranking strategy ('pointwise' or 'pairwise')
+            cross_encoder_options: Optional configuration passed to the Reranker
+            hybrid_dense_weight: Default dense weight for hybrid rank fusion
         """
         self.api_key = openai_api_key
         
         # Determine retrieval method and required indices
         if retrieval_method == "hybrid":
             self.retrieval_method = RetrievalMethod.HYBRID
-            retrieval_methods = ["bm25", "dense"]
         elif retrieval_method == "bm25":
             self.retrieval_method = RetrievalMethod.BM25_ONLY
-            retrieval_methods = ["bm25"]
         elif retrieval_method == "dense":
             self.retrieval_method = RetrievalMethod.DENSE_ONLY
-            retrieval_methods = ["dense"]
         else:
             raise ValueError(f"Invalid retrieval method: {retrieval_method}")
         
         # Initialize all components with retrieval method info
         self.preprocessor = DocumentPreprocessor(
-            openai_api_key, 
             chunk_size, 
             chunk_overlap
         )
         self.retriever = None  # Will be initialized after preprocessing
-        self.reranker = Reranker(default_k=5)
-        self.generator = ResponseGenerator(openai_api_key, generation_model, temperature)
-        self.evaluator = Evaluator(openai_api_key)
+        self.base_component = LLMBase(model_name=generation_model)
+        self.hybrid_dense_weight = max(0.0, min(1.0, float(hybrid_dense_weight)))
+        self.reranker = Reranker(default_k=10, hybrid_dense_weight=self.hybrid_dense_weight)
+        self.generator = ResponseGenerator(generation_model, temperature)
+        self.evaluator = Evaluator()
         self.is_ready = False
 
         self.langfuse_context = get_client()
     
-    def load_and_process_documents(self, documents: List[Dict[str, Any]]) -> None:
+    def load_and_process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
         """
         Load documents and create searchable index
         
@@ -78,7 +81,7 @@ class RAGPipeline:
         print("Loading and processing documents...")
         
         # Process documents with preprocessor
-        self.preprocessor.process_documents(documents)
+        self.preprocessor.process_documents(documents, use_context=use_context)
         
         # Initialize retriever with processed index
         self.retriever = Retriever(self.preprocessor, self.api_key)
@@ -86,26 +89,26 @@ class RAGPipeline:
         self.is_ready = True
         print(f"Pipeline ready! Processed {len(documents)} documents.")
     
-    def load_from_saved_index(self, index_path: str, metadata_path: str) -> None:
-        """
-        Load pipeline from saved FAISS index and metadata
+    # def load_from_saved_index(self, index_path: str, metadata_path: str, use_context: bool = True) -> None:
+    #     """
+    #     Load pipeline from saved FAISS index and metadata
         
-        Args:
-            index_path: Path to FAISS index file
-            metadata_path: Path to metadata file
-        """
-        print("Loading from saved index...")
+    #     Args:
+    #         index_path: Path to FAISS index file
+    #         metadata_path: Path to metadata file
+    #     """
+    #     print("Loading from saved index...")
         
-        # Load preprocessed data
-        self.preprocessor.load_index(index_path, metadata_path)
+    #     # Load preprocessed data
+    #     self.preprocessor.load_index(index_path, metadata_path, use_context=use_context)
         
-        # Initialize retriever
-        self.retriever = Retriever(self.preprocessor, self.api_key)
+    #     # Initialize retriever
+    #     self.retriever = Retriever(self.preprocessor, self.api_key)
         
-        self.is_ready = True
-        print("Pipeline loaded successfully!")
+    #     self.is_ready = True
+    #     print("Pipeline loaded successfully!")
     
-    def save_index(self, index_path: str, metadata_path: str) -> None:
+    def save_index(self, index_path: str, metadata_path: str, use_context: bool = True) -> None:
         """
         Save the current index and metadata
         
@@ -116,12 +119,15 @@ class RAGPipeline:
         if not self.is_ready:
             raise ValueError("Pipeline not ready. Process documents first.")
         
-        self.preprocessor.save_index(index_path, metadata_path)
+        self.preprocessor.save_index(index_path, metadata_path, use_context=use_context)
     
     async def query_with_eval(self, query: str, 
             ground_truth: str,
             retrieval_k: int = 20,
             final_k: int = 10,
+            dense_weight: Optional[float] = None,
+            bm25_k: Optional[int] = None,
+            dense_k: Optional[int] = None,
             ) -> Dict[str, Any]:
         """
         Process a query through the complete RAG pipeline
@@ -139,16 +145,58 @@ class RAGPipeline:
         
         print(f"Processing query with Langfuse tracing: {query}")
 
-        with self.langfuse_context.start_as_current_span(name="rag") as trace:
+        with self.langfuse_context.start_as_current_span(name=f"rag-{self.retrieval_method.value}") as trace:
             # Store trace_id for later use
             trace_id = trace.trace_id
 
             with trace.start_as_current_span(
+                name="query_reformation",
+                input={'query': query}
+            ) as reformulation_span:
+                print("0. Reformulating query...")
+                response = self.base_component.reformate_query(query)
+                reformation_output = {
+                    'reformulated_query': response.reformatted_query,
+                    'rationale': response.rationale
+                }
+                reformulation_span.update(output=reformation_output)
+
+            with trace.start_as_current_span(
                 name="retrieval",
-                input={'question': query, 'retrieval_k': retrieval_k, 'method': self.retrieval_method.value}
+                input={'question': reformation_output['reformulated_query'], 'retrieval_k': retrieval_k, 'method': self.retrieval_method.value}
             ) as retrieval_span:
                 print("1. Retrieving relevant chunks...")
-                retrieved_chunks = self.retriever.retrieve(query, retrieval_k, method=self.retrieval_method)
+                effective_query = reformation_output['reformulated_query']
+                retrieval_kwargs: Dict[str, Any] = {}
+                if self.retrieval_method == RetrievalMethod.HYBRID:
+                    retrieval_kwargs['bm25_k'] = bm25_k or retrieval_k
+                    retrieval_kwargs['dense_k'] = dense_k or retrieval_k
+
+                retrieval_payload = self.retriever.retrieve(
+                    effective_query,
+                    retrieval_k,
+                    method=self.retrieval_method,
+                    **retrieval_kwargs
+                )
+
+                hybrid_metadata: Dict[str, Any] = {}
+                if self.retrieval_method == RetrievalMethod.HYBRID and isinstance(retrieval_payload, dict):
+                    effective_weight = dense_weight if dense_weight is not None else self.hybrid_dense_weight
+                    retrieved_chunks = self.reranker.rank_fusion(
+                        bm25_results=retrieval_payload.get('bm25', []),
+                        dense_results=retrieval_payload.get('dense', []),
+                        k=retrieval_k,
+                        dense_weight=effective_weight
+                    )
+                    hybrid_metadata = {
+                        'dense_weight': effective_weight,
+                        'hybrid_sources': {
+                            'bm25': len(retrieval_payload.get('bm25', [])),
+                            'dense': len(retrieval_payload.get('dense', []))
+                        }
+                    }
+                else:
+                    retrieved_chunks = retrieval_payload  # type: ignore[assignment]
 
                 contexts = [chunk['chunk_text'] for chunk in retrieved_chunks]
                 retrieval_output = {
@@ -157,6 +205,8 @@ class RAGPipeline:
                     'avg_similarity': sum(c['similarity_score'] for c in retrieved_chunks) / len(retrieved_chunks) if retrieved_chunks else 0,
                     'retrieval_method': self.retrieval_method.value
                 }
+                if hybrid_metadata:
+                    retrieval_output.update(hybrid_metadata)
                 retrieval_span.update(output=retrieval_output)
 
             with trace.start_as_current_span(
@@ -166,10 +216,7 @@ class RAGPipeline:
                 print("2. Reranking chunks...")
                 processed_chunks = self.reranker.process_chunks(
                     retrieved_chunks,
-                    k=final_k,
-                    remove_duplicates=True,
-                    filter_length=True,
-                    diversify=True
+                    k=final_k
                 )
                 rerank_output = {
                     'processed_chunks': len(processed_chunks),
@@ -182,16 +229,21 @@ class RAGPipeline:
                 input={'question': query, 'contexts': [chunk['chunk_text'] for chunk in processed_chunks]}
             ) as generation_span:
                 print("3. Generating response...")
-                generation_result = self.generator.generate_with_chunks(
-                    query, processed_chunks
+                response = self.base_component.generate_answer(
+                    reformation_output['reformulated_query'],
+                    rerank_output['final_contexts']
                 )
+
                 generation_output = {
-                    'answer': generation_result.get('response', 'No response generated'),
+                    'answer': response.answer,
+                    'references': response.reference,
+                    'rationale': response.rationale
                 }
+
                 generation_span.update(output=generation_output)
 
             print("4. Evaluating response...")
-            evaluation_scores = await self.evaluator.evaluate_trace(query, contexts, generation_result.get('response', 'No response generated'), ground_truth)
+            evaluation_scores = await self.evaluator.evaluate_trace(query, contexts, generation_output['answer'], ground_truth)
 
             for key, value in evaluation_scores.items():
                 trace.score(
@@ -203,14 +255,20 @@ class RAGPipeline:
         return evaluation_scores
 
     async def batch_query(self, dataset: List[Dict[str, str]], 
-                               retrieval_k: int = 20, final_k: int = 10,
-                               max_concurrent: int = 5) -> List[Dict[str, Any]]:
+                               retrieval_k: int = 50, final_k: int = 12,
+                               max_concurrent: int = 5,
+                               dense_weight: Optional[float] = None,
+                               bm25_k: Optional[int] = None,
+                               dense_k: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Process large datasets using asyncio concurrency (BEST for API-heavy workloads)
         
         Args:
             dataset: List of {'query': str, 'ground_truth': str}
             max_concurrent: Maximum concurrent tasks
+            dense_weight: Optional override for hybrid dense weighting
+            bm25_k: Optional override for BM25 candidate count
+            dense_k: Optional override for dense candidate count
             
         Returns:
             List of evaluation results
@@ -227,7 +285,10 @@ class RAGPipeline:
                         query=item['query'],
                         ground_truth=item['ground_truth'], 
                         retrieval_k=retrieval_k,
-                        final_k=final_k
+                        final_k=final_k,
+                        dense_weight=dense_weight,
+                        bm25_k=bm25_k,
+                        dense_k=dense_k
                     )
                     return result
                 except Exception as e:
