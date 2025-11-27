@@ -4,21 +4,33 @@ Implements iterative refinement based on evaluation feedback
 """
 
 import asyncio
-from typing import Optional, List, Dict, Any, Annotated, Union, Tuple
+from typing import Optional, List, Dict, Any, Annotated, Union, Tuple, Callable
 from typing_extensions import TypedDict as ExtendedTypedDict
-import operator
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-
-from LLMBase import LLMBase
 from preprocessor import DocumentPreprocessor
 from retrieval import Retriever, RetrievalMethod
 from reranker import Reranker
-from generation import ResponseGenerator
 from evaluation import Evaluator
-from prompt_optimization import PromptOptimizationCycle
+from dspy_optimization import (
+    DSPYPromptOrchestrator,
+    PromptCallResult,
+    RewardManager,
+    optimize_prompts_with_representatives,
+    build_trainsets_from_results,
+)
+
+
+def _bounded_history(max_items: int):
+    """Merge function for LangGraph state that keeps only the most recent N entries."""
+    def _merge(left, right):
+        combined = (left or []) + (right or [])
+        if not combined:
+            return []
+        return combined[-max_items:]
+    return _merge
 
 
 class RAGState(ExtendedTypedDict):
@@ -55,14 +67,16 @@ class RAGState(ExtendedTypedDict):
     retrieval_eval: Optional[Dict[str, float]]
     reranking_eval: Optional[Dict[str, float]]
     generation_eval: Optional[Dict[str, float]]
+    judge_eval: Optional[Dict[str, Dict[str, Any]]]
     overall_score: Optional[float]
-    
+    reformulation_feedback: Optional[str]
+
     # Iteration control
     iteration: int
     max_iterations: int
     converged: bool
-    improvement_history: Annotated[List[Dict[str, Any]], operator.add]
-    prompt_history: Annotated[List[Dict[str, Any]], operator.add]
+    improvement_history: Annotated[List[Dict[str, Any]], _bounded_history(20)]
+    prompt_history: Annotated[List[Dict[str, Any]], _bounded_history(20)]
     
     # Configuration
     retrieval_k: int
@@ -73,7 +87,7 @@ class RAGState(ExtendedTypedDict):
     generation_round: int
 
 
-class SelfImprovingRAG:
+class DSPYRAG:
     """
     Self-improving RAG Pipeline using LangGraph
     
@@ -85,13 +99,16 @@ class SelfImprovingRAG:
         self,
         chunk_size: int = 600,
         chunk_overlap: int = 50,
-        generation_model: str = "gemini-2.5-flash",
-        evaluator_model: str = "gemini-2.5-flash",
+        generation_model: str = "gpt-4o-mini",
+        evaluator_model: str = "gpt-4o-mini",
         temperature: float = 0,
         retrieval_method: str = "hybrid",
         max_iterations: int = 3,
         convergence_threshold: float = 0.85,
-        prompt_optimization_config: Optional[Dict[str, Any]] = None,
+        dspy_prompts: Optional[Dict[str, Any]] = None,
+        enable_prompt_judge: bool = True,
+        dspy_judge_prompts: Optional[Dict[str, str]] = None,
+        reward_judge_weight: float = 0.1,
     ):
         """
         Initialize the self-improving RAG pipeline
@@ -106,7 +123,6 @@ class SelfImprovingRAG:
             retrieval_method: "hybrid", "bm25", or "dense"
             max_iterations: Maximum refinement iterations
             convergence_threshold: Score threshold to stop iterations (0-1)
-            prompt_optimization_config: Optional overrides for the RL prompt optimizer
         """
         
         self.max_iterations = max_iterations
@@ -125,25 +141,143 @@ class SelfImprovingRAG:
         # Initialize components
         self.preprocessor = DocumentPreprocessor(chunk_size, chunk_overlap)
         self.retriever = None
-        self.base_component = LLMBase(model_name=generation_model)
         self.reranker = Reranker(default_k=10)
-        self.generator = ResponseGenerator(generation_model, temperature)
         self.evaluator = Evaluator(model=evaluator_model)
-        optimizer_config = prompt_optimization_config or {}
-        self.prompt_optimizer = PromptOptimizationCycle(**optimizer_config)
+        self.prompter = DSPYPromptOrchestrator(
+            enable_judge=enable_prompt_judge,
+        )
+        self.reward_manager = RewardManager(judge_weight=reward_judge_weight)
         
         self.is_ready = False
         
         # Build the LangGraph workflow
         self.graph = self._build_graph()
     
-    def load_and_process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True):
-        """Load documents and create searchable index"""
+    def load_and_process_documents(
+        self,
+        documents: List[Dict[str, Any]],
+        use_context: bool = True,
+        *,
+        evaluation_queries: Optional[List[Dict[str, Any]]] = None,
+        rewrite_provider: Optional[Callable[[Dict[str, Any]], str]] = None,
+        metric_fns: Optional[Dict[str, Callable[[Any, Any], float]]] = None,
+    ):
+        """
+        Load documents, build indices, and optionally compile DSPy prompts using representatives.
+        
+        Args:
+            documents: Corpus to ingest.
+            use_context: Whether to run contextual retrieval during preprocessing.
+            evaluation_queries: Seed queries (with optional ground_truth) used to pick representatives.
+            rewrite_provider: Optional function that supplies target rewrites per representative.
+            metric_fns: Optional per-stage metric functions for DSPy optimizers.
+        """
         print("Loading and processing documents...")
         self.preprocessor.process_documents(documents, use_context=use_context)
         self.retriever = Retriever(self.preprocessor)
         self.is_ready = True
         print(f"Pipeline ready! Processed {len(documents)} documents.")
+        
+        if evaluation_queries:
+            self._bootstrap_prompts_from_representatives(
+                evaluation_queries=evaluation_queries,
+                rewrite_provider=rewrite_provider,
+                metric_fns=metric_fns,
+            )
+    
+    def _bootstrap_prompts_from_representatives(
+        self,
+        *,
+        evaluation_queries: List[Dict[str, Any]],
+        rewrite_provider: Optional[Callable[[Dict[str, Any]], str]] = None,
+        metric_fns: Optional[Dict[str, Callable[[Any, Any], float]]] = None,
+    ) -> None:
+        """Select representatives, compile DSPy modules, and cache the trainsets."""
+        if not self.retriever:
+            raise ValueError("Retriever not initialized; call load_and_process_documents first.")
+        representatives = self.preprocessor.get_representative_data(evaluation_queries)
+        if not representatives:
+            print("No representative queries available for DSPy prompt optimization.")
+            return
+        
+        def context_provider(rep: Dict[str, Any]) -> List[str]:
+            return self._representative_contexts(rep, k=self.reranker.default_k)
+        
+        optimize_prompts_with_representatives(
+            orchestrator=self.prompter,
+            representatives=representatives,
+            context_provider=context_provider,
+            rewrite_provider=rewrite_provider,
+            metric_fns=metric_fns,
+        )
+        print(f"Optimized DSPy prompts using {len(representatives)} representative queries.")
+    
+    def _representative_contexts(self, rep: Dict[str, Any], k: int) -> List[str]:
+        """Retrieve top-k chunk texts for a representative query."""
+        query = rep.get("query", "")
+        if not query or not self.retriever:
+            return []
+        retrieval_result = self.retriever.retrieve(
+            query,
+            max(k, self.reranker.default_k),
+            method=self.retrieval_method
+        )
+        if isinstance(retrieval_result, dict):
+            combined = (retrieval_result.get("bm25") or []) + (retrieval_result.get("dense") or [])
+        else:
+            combined = retrieval_result or []
+        if not combined:
+            return []
+        processed = self.reranker.process_chunks(combined, k=k)
+        return [chunk["chunk_text"] for chunk in processed]
+
+    def _refresh_prompts_from_results(
+        self,
+        results: List[Dict[str, Any]],
+        *,
+        threshold: float,
+        window: int,
+        metric_fns: Optional[Dict[str, Callable[[Any, Any], float]]] = None,
+    ) -> bool:
+        """Refresh DSPy modules between batches when rewards lag."""
+        if not results:
+            return False
+
+        reward_values: List[float] = []
+        for res in results:
+            if not isinstance(res, dict):
+                continue
+            for entry in res.get("improvement_history") or []:
+                reward = entry.get("reward")
+                if isinstance(reward, (int, float)):
+                    reward_values.append(float(reward))
+
+        if not reward_values:
+            print("No rewards available for prompt refresh; skipping.")
+            return False
+
+        w = max(window, 1)
+        recent_rewards = reward_values[-w:]
+        mean_reward = sum(recent_rewards) / len(recent_rewards)
+
+        if mean_reward >= threshold:
+            print(f"Prompt refresh skipped (mean reward={mean_reward:.3f} >= threshold={threshold:.2f}).")
+            return False
+
+        trainsets = build_trainsets_from_results(results)
+        total_examples = sum(len(v) for v in trainsets.values())
+        if total_examples == 0:
+            print("No training examples derived from batch; skipping prompt refresh.")
+            return False
+
+        prev_version = getattr(self.prompter, "version", 0)
+        self.prompter.compile(trainsets, metric_fns=metric_fns)
+        new_version = getattr(self.prompter, "version", prev_version)
+        print(
+            f"Refreshed DSPy prompts from batch rewards (v{prev_version} -> v{new_version}); "
+            f"mean reward={mean_reward:.3f}, examples={total_examples}"
+        )
+        return True
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow with feedback loops"""
@@ -206,7 +340,8 @@ class SelfImprovingRAG:
             "convergence_threshold": state.get("convergence_threshold", self.convergence_threshold),
             "retrieval_round": 0,
             "rerank_round": 0,
-            "generation_round": 0
+            "generation_round": 0,
+            "reformulation_feedback": None,
         }
     
     def _reformulate_query_node(self, state: RAGState) -> Dict[str, Any]:
@@ -215,20 +350,21 @@ class SelfImprovingRAG:
         
         query = state["query"]
         print(f"  Original Query: {query}")
-        prompt_text, prompt_record = self.prompt_optimizer.select_prompt(
-            stage="reformulation",
-            iteration_id=state["iteration"],
-            context={"query": query}
+        feedback = state.get("reformulation_feedback") or ""
+        result: PromptCallResult = self.prompter.reformulate(
+            query,
+            feedback=feedback,
         )
-        
-        response = self.base_component.reformate_query(query, prompt_override=prompt_text)
-        print(f"  Reformulated Query: {response.reformatted_query}")
-        prompt_record["model_output"] = response.reformatted_query
-        prompt_record["rationale"] = response.rationale
-        
+        rewritten = result.output["reformulated_query"]
+        print(f"  Reformulated Query: {rewritten}")
+        if feedback:
+            print(f"  Reformulation feedback: {feedback}")
+
+        prompt_record = self._augment_prompt_record(result.prompt_record, state)
+
         return {
-            "reformulated_query": response.reformatted_query,
-            "reformation_rationale": response.rationale
+            "reformulated_query": rewritten,
+            "prompt_history": [prompt_record]
         }
     
     def _retrieve_node(self, state: RAGState) -> Dict[str, Any]:
@@ -246,6 +382,7 @@ class SelfImprovingRAG:
         )
         
         # Handle hybrid vs single method results
+        # TODO: additional metrics for hybrid retrieval to measure fusion quality
         if isinstance(retrieval_result, dict) and self.retrieval_method == RetrievalMethod.HYBRID:
             retrieved_chunks = self.reranker.optimize_fusion_params(
                 bm25_results=retrieval_result.get('bm25', []),
@@ -263,6 +400,73 @@ class SelfImprovingRAG:
             "contexts": contexts,
             "retrieval_method": self.retrieval_method.value
         }
+
+    def _compute_retrieval_quality(self, fused_chunks: List[Dict[str, Any]]) -> Dict[str, float]:
+        """Lightweight metrics to pick the best hybrid fusion weight."""
+        if not fused_chunks:
+            return {
+                "fusion_quality": 0.0,
+                "overlap_ratio": 0.0,
+                "source_balance": 0.0,
+                "score_concentration": 0.0,
+                "rank_agreement": 0.0,
+            }
+
+        total = len(fused_chunks)
+        overlap = bm25_only = dense_only = 0
+        rank_agreements: List[float] = []
+        fusion_scores: List[float] = []
+
+        for chunk in fused_chunks:
+            sources = chunk.get("hybrid_sources") or {}
+            from_bm25 = bool(sources.get("bm25"))
+            from_dense = bool(sources.get("dense"))
+
+            if from_bm25 and from_dense:
+                overlap += 1
+            elif from_bm25:
+                bm25_only += 1
+            elif from_dense:
+                dense_only += 1
+
+            bm25_rank = chunk.get("bm25_rank")
+            dense_rank = chunk.get("dense_rank")
+            rank_parts: List[float] = []
+            if isinstance(bm25_rank, (int, float)) and bm25_rank > 0:
+                rank_parts.append(1.0 / float(bm25_rank))
+            if isinstance(dense_rank, (int, float)) and dense_rank > 0:
+                rank_parts.append(1.0 / float(dense_rank))
+            if rank_parts:
+                rank_agreements.append(sum(rank_parts) / len(rank_parts))
+
+            fusion_scores.append(float(chunk.get("fusion_raw_score", 0.0)))
+
+        overlap_ratio = overlap / total
+        source_balance = 1.0 - abs(bm25_only - dense_only) / total
+        source_balance = max(source_balance, 0.0)
+
+        score_concentration = 0.0
+        if fusion_scores:
+            sorted_scores = sorted(fusion_scores, reverse=True)
+            total_score = sum(sorted_scores) or 1e-9
+            score_concentration = sum(sorted_scores[: min(3, len(sorted_scores))]) / total_score
+
+        rank_agreement = sum(rank_agreements) / len(rank_agreements) if rank_agreements else 0.0
+
+        fusion_quality = (
+            0.4 * overlap_ratio
+            + 0.25 * source_balance
+            + 0.2 * score_concentration
+            + 0.15 * rank_agreement
+        )
+
+        return {
+            "fusion_quality": fusion_quality,
+            "overlap_ratio": overlap_ratio,
+            "source_balance": source_balance,
+            "score_concentration": score_concentration,
+            "rank_agreement": rank_agreement,
+        }
     
     def _rerank_node(self, state: RAGState) -> Dict[str, Any]:
         """Rerank retrieved documents"""
@@ -277,74 +481,83 @@ class SelfImprovingRAG:
         )
         
         final_contexts = [chunk['chunk_text'] for chunk in processed_chunks]
+        prompt_history: List[Dict[str, Any]] = []
         reranking_rationale = None
+
         if final_contexts:
-            prompt_text, prompt_record = self.prompt_optimizer.select_prompt(
-                stage="reranking",
-                iteration_id=state["iteration"],
-                context={"query": state["query"], "num_candidates": len(final_contexts)}
-            )
-            try:
-                llm_response = self.base_component.rerank_documents(
-                    state["query"],
-                    final_contexts,
-                    prompt_override=prompt_text
-                )
-                reranking_rationale = llm_response.rationale
-                prompt_record["rationale"] = llm_response.rationale
-                ranked_texts = llm_response.ranked_documents
-                ordered_chunks: List[Dict[str, Any]] = []
-                remaining = processed_chunks.copy()
-                for text in ranked_texts:
-                    match = next((chunk for chunk in remaining if chunk['chunk_text'] == text), None)
-                    if match:
-                        ordered_chunks.append(match)
-                        remaining.remove(match)
-                ordered_chunks.extend(remaining)
-                processed_chunks = ordered_chunks[:final_k]
-                final_contexts = [chunk['chunk_text'] for chunk in processed_chunks]
-            except Exception as err:
-                reranking_rationale = f"Prompt-based reranker failed: {err}"
-                prompt_record["error"] = str(err)
-        
+            result: PromptCallResult = self.prompter.rerank(state["query"], final_contexts)
+            ranked_texts = result.output.get("ranked_contexts", final_contexts)
+            reranking_rationale = result.output.get("rationale")
+            ordered_chunks: List[Dict[str, Any]] = []
+            remaining = processed_chunks.copy()
+            for text in ranked_texts:
+                match = next((chunk for chunk in remaining if chunk["chunk_text"] == text), None)
+                if match:
+                    ordered_chunks.append(match)
+                    remaining.remove(match)
+            ordered_chunks.extend(remaining)
+            processed_chunks = ordered_chunks[:final_k]
+            final_contexts = [chunk["chunk_text"] for chunk in processed_chunks]
+
+            prompt_record = self._augment_prompt_record(result.prompt_record, state)
+            prompt_history.append(prompt_record)
+        else:
+            reranking_rationale = None
+
         return {
             "reranked_chunks": processed_chunks,
             "final_contexts": final_contexts,
-            "reranking_rationale": reranking_rationale
+            "reranking_rationale": reranking_rationale,
+            "prompt_history": prompt_history,
         }
     
     def _generate_node(self, state: RAGState) -> Dict[str, Any]:
         """Generate answer from contexts"""
         print(f"[Iteration {state['iteration']}] Generating answer...")
-        
-        rerank_eval = state.get("reranking_eval") or {}
-        prompt_text, prompt_record = self.prompt_optimizer.select_prompt(
-            stage="generation",
-            iteration_id=state["iteration"],
-            context={
-                "query": state["query"],
-                "num_contexts": len(state.get("final_contexts") or []),
-                "rerank_confidence": rerank_eval.get("reranking_confidence", 0.0)
-            }
-        )
         contexts_to_use = state.get("final_contexts") or []
-        response = self.base_component.generate_answer(
-            state["reformulated_query"],
-            "\n\n".join(contexts_to_use),
-            prompt_override=prompt_text
+        result: PromptCallResult = self.prompter.generate(
+            query=state["reformulated_query"],
+            context=contexts_to_use,
+            reference=state.get("ground_truth"),
         )
-        prompt_record["rationale"] = response.rationale
-
-        return {
-            "answer": response.answer,
-            "answer_reference": response.reference,
-            "generation_rationale": response.rationale
+        prompt_record = self._augment_prompt_record(result.prompt_record, state)
+        updates: Dict[str, Any] = {
+            "answer": result.output.get("answer"),
+            "answer_reference": None,
+            "generation_rationale": result.output.get("rationale"),
+            "prompt_history": [prompt_record],
         }
+        return updates
+
+    def _augment_prompt_record(self, prompt_record: Dict[str, Any], state: RAGState) -> Dict[str, Any]:
+        """Attach iteration metadata to prompt records for later auditing."""
+        record = dict(prompt_record)
+        record.setdefault("stage", prompt_record.get("stage"))
+        record["iteration"] = state.get("iteration", 0)
+        return record
 
     def _stage_memory(self, stage: str, state_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Stage-specific LangGraph memory for agentic rewards."""
         history = state_snapshot.get("improvement_history") or []
         return [entry for entry in history if entry.get("stage") == stage]
+
+    def _latest_reward(self, state: RAGState, stage: str) -> Optional[float]:
+        """Fetch the most recent reward for the given stage."""
+        for entry in reversed(state.get("improvement_history") or []):
+            if entry.get("stage") == stage and entry.get("reward") is not None:
+                try:
+                    return float(entry["reward"])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _update_judge_eval(self, state: RAGState, stage: str, feedback: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist judge feedback in state for later reward/analysis use."""
+        if not feedback:
+            return {}
+        judge_map = dict(state.get("judge_eval") or {})
+        judge_map[stage] = feedback
+        return {"judge_eval": judge_map}
 
     def _finalize_prompt_stage(
         self,
@@ -357,25 +570,28 @@ class SelfImprovingRAG:
         if metric_overrides:
             snapshot.update(metric_overrides)
         stage_memory = self._stage_memory(stage, snapshot)
-        prompt_records = self.prompt_optimizer.finalize_iteration(snapshot, stages=[stage], memory=stage_memory)
-        if prompt_records:
-            print(f"  Prompt RL updates ({stage}):")
-            for record in prompt_records:
-                reward = record.get("reward") or 0.0
-                normalized = record.get("normalized_reward") or 0.0
-                print(f"    [{record['stage']}] {record['prompt_name']} → reward {reward:.3f}, norm {normalized:.3f}")
-        improvements: List[Dict[str, Any]] = []
-        for record in prompt_records or []:
-            improvements.append({
-                "stage": stage,
-                "iteration": snapshot.get("iteration", 0),
-                "prompt_name": record.get("prompt_name"),
-                "reward": record.get("reward"),
-                "normalized_reward": record.get("normalized_reward"),
-                "metrics_snapshot": record.get("metrics_snapshot"),
-                "context": record.get("context", {}),
-            })
-        return prompt_records or [], improvements
+        reward, breakdown = self.reward_manager.compute(stage, snapshot, stage_memory)
+        prompt_history = snapshot.get("prompt_history") or []
+        latest_prompt = next((p for p in reversed(prompt_history) if p.get("stage") == stage), {})
+        prompt_record = {
+            "stage": stage,
+            "iteration": snapshot.get("iteration", 0),
+            "prompt_name": latest_prompt.get("prompt_name"),
+            "prompt_text": latest_prompt.get("prompt_text"),
+            "reward": reward,
+            "metrics_snapshot": metric_overrides or {},
+            "reward_breakdown": breakdown,
+        }
+        improvements = [{
+            "stage": stage,
+            "iteration": snapshot.get("iteration", 0),
+            "prompt_name": latest_prompt.get("prompt_name"),
+            "reward": reward,
+            "metrics_snapshot": metric_overrides or {},
+            "reward_breakdown": breakdown,
+        }]
+        print(f"  Prompt updates ({stage}): reward={reward:.3f} total={breakdown.get('total', reward):.3f}")
+        return [prompt_record], improvements
     
     async def _evaluate_retrieval_node(self, state: RAGState) -> Dict[str, Any]:
         """Evaluate retrieval quality before reranking."""
@@ -390,18 +606,42 @@ class SelfImprovingRAG:
         
         # Use RAGAS to evaluate retrieval (context_precision & context_recall)
         contexts = [chunk['chunk_text'] for chunk in retrieved_chunks]
-        scores = await self.evaluator.evaluate_metrics(
-            metric_keys=['context_precision', 'context_recall'],
+        print(f"  Query: {state['query']}")
+        print(f"  Contexts: {contexts}")
+        print(f"  Ground Truth: {state.get('ground_truth')}")
+        scores = await self.evaluator.evaluate_retrieval(
             query=state["query"],
             contexts=contexts,
             ground_truth=state.get("ground_truth")
-        )
+        )  
         
         print(f"  Retrieval RAGAS metrics: precision={scores.get('context_precision', 0.0):.3f}, "
               f"recall={scores.get('context_recall', 0.0):.3f}")
         
         round_idx = state.get("retrieval_round", 0) + 1
+
+        feedback = None
+        precision = scores.get("context_precision", 0.0)
+        recall = scores.get("context_recall", 0.0)
+        if precision < 0.6 or recall < 0.6:
+            import re
+
+            q_terms = set(re.findall(r"[A-Z][A-Za-z0-9\-]+", state["query"]))
+            ctx_blob = " ".join(contexts)
+            missing = [t for t in q_terms if t not in ctx_blob]
+            parts = [f"precision={precision:.2f}", f"recall={recall:.2f}"]
+            if missing:
+                parts.append(f"missing: {', '.join(missing[:5])}")
+            feedback = "; ".join(parts)
         
+        judge_update: Dict[str, Any] = {}
+        if getattr(self.prompter, "judge", None) and getattr(self.prompter.judge, "enabled", False):
+            judge_feedback = self.prompter.judge.assess_reformulation(
+                query=state["query"],
+                rewritten=state.get("reformulated_query", ""),
+            )
+            judge_update = self._update_judge_eval(state, "reformulation", judge_feedback)
+
         prompt_records, improvements = self._finalize_prompt_stage(
             stage="reformulation",
             state_snapshot=state,
@@ -415,8 +655,11 @@ class SelfImprovingRAG:
         return {
             "retrieval_eval": scores,
             "retrieval_round": round_idx,
+            "iteration": state.get("iteration", 0) + 1,
             "prompt_history": prompt_records or [],
-            "improvement_history": improvements or []
+            "improvement_history": improvements or [],
+            "reformulation_feedback": feedback,
+            **judge_update,
         }
 
     async def _evaluate_reranking_node(self, state: RAGState) -> Dict[str, Any]:
@@ -430,11 +673,36 @@ class SelfImprovingRAG:
             return {"reranking_eval": None, "rerank_round": round_idx}
         
         contexts = [chunk['chunk_text'] for chunk in reranked_chunks]
-        score = await self.evaluator.evaluate_metrics(
-            metric_keys=['context_precision'],
+        score = await self.evaluator.evaluate_reranking(
             query=state["query"],
             contexts=contexts,
-            ground_truth=state.get("ground_truth")
+            ground_truth=state.get("ground_truth")   
+        )
+
+        judge_update: Dict[str, Any] = {}
+        if getattr(self.prompter, "judge", None) and getattr(self.prompter.judge, "enabled", False):
+            judge_feedback = self.prompter.judge.assess_reranking(query=state["query"], contexts=contexts)
+            judge_update = self._update_judge_eval(state, "reranking", judge_feedback)
+
+        # Lightweight structural metrics to satisfy routing thresholds.
+        scores = [chunk.get("cross_encoder_score", 0.0) for chunk in reranked_chunks if chunk is not None]
+        score_concentration = 0.0
+        if scores:
+            sorted_scores = sorted(scores, reverse=True)
+            total_scores = sum(sorted_scores) or 1e-9
+            score_concentration = sum(sorted_scores[: min(3, len(sorted_scores))]) / total_scores
+
+        baseline = (state.get("retrieval_eval") or {}).get("context_precision")
+        rerank_precision = score.get("context_precision", 0.0)
+        score_improvement = (rerank_precision - baseline) if baseline is not None else 0.0
+
+        reranking_confidence = self.reward_manager._safe_avg([rerank_precision, score_concentration])  # type: ignore[attr-defined]
+        score.update(
+            {
+                "score_concentration": score_concentration,
+                "score_improvement": score_improvement,
+                "reranking_confidence": reranking_confidence,
+            }
         )
         
         round_idx = state.get("rerank_round", 0) + 1
@@ -445,14 +713,19 @@ class SelfImprovingRAG:
             metric_overrides={
                 "reranking_eval": score,
                 "context_precision_score": score.get('context_precision'),
+                "score_concentration": score_concentration,
+                "score_improvement": score_improvement,
+                "reranking_confidence": reranking_confidence,
             }
         )
         
         return {
             "reranking_eval": score,
             "rerank_round": round_idx,
+            "iteration": state.get("iteration", 0) + 1,
             "prompt_history": prompt_records or [],
-            "improvement_history": improvements or []
+            "improvement_history": improvements or [],
+            **judge_update,
         }
 
     async def _evaluate_generation_node(self, state: RAGState) -> Dict[str, Any]:
@@ -460,13 +733,27 @@ class SelfImprovingRAG:
         print(f"[Iteration {state['iteration']}] Evaluating generation output...")
         
         # Use RAGAS to evaluate generation (faithfulness, answer_relevancy, context_utilization)
-        scores = await self.evaluator.evaluate_metrics(
-            metric_keys=['faithfulness', 'answer_correctness'],
+        scores = await self.evaluator.evaluate_generation(
             query=state["query"],
             contexts=state.get("final_contexts") or [],
             answer=state.get("answer") or "",
-            ground_truth=state.get("ground_truth")
+            ground_truth=state.get("ground_truth")   
         )
+
+        judge_update: Dict[str, Any] = {}
+        if getattr(self.prompter, "judge", None) and getattr(self.prompter.judge, "enabled", False):
+            judge_feedback = self.prompter.judge.assess_generation(
+                query=state["query"],
+                answer=state.get("answer") or "",
+                contexts=state.get("final_contexts") or [],
+                reference=state.get("ground_truth"),
+            )
+            judge_update = self._update_judge_eval(state, "generation", judge_feedback)
+        faithfulness_score = scores.get('faithfulness') or 0.0
+        answer_correctness_score = scores.get('answer_correctness') or 0.0
+        answer_relevancy_score = scores.get('answer_relevancy') or answer_correctness_score
+        available = [val for val in (faithfulness_score, answer_relevancy_score) if val is not None]
+        overall_score = sum(available) / len(available) if available else 0.0
         
         round_idx = state.get("generation_round", 0) + 1
         
@@ -475,16 +762,24 @@ class SelfImprovingRAG:
             state_snapshot=state,
             metric_overrides={
                 "generation_eval": scores,
-                "faithfulness_score": scores.get('faithfulness'),
-                "answer_correctness_score": scores.get('answer_correctness'),
+                "faithfulness_score": faithfulness_score,
+                "answer_correctness_score": answer_correctness_score,
+                "answer_relevancy_score": answer_relevancy_score,
+                "overall_score": overall_score,
             }
         )
         
         return {
             "generation_eval": scores,
             "generation_round": round_idx,
+            "iteration": state.get("iteration", 0) + 1,
+            "faithfulness_score": faithfulness_score,
+            "answer_correctness_score": answer_correctness_score,
+            "answer_relevancy_score": answer_relevancy_score,
+            "overall_score": overall_score,
             "prompt_history": prompt_records or [],
-            "improvement_history": improvements or []
+            "improvement_history": improvements or [],
+            **judge_update,
         }
     
     
@@ -498,6 +793,7 @@ class SelfImprovingRAG:
         rounds = state.get("retrieval_round", 0)
         max_rounds = state.get("max_iterations", self.max_iterations)
         metrics = state.get("retrieval_eval") or {}
+        reward_signal = self._latest_reward(state, "reformulation") or 0.0
         
         # Get RAGAS retrieval metrics
         context_precision = metrics.get("context_precision", 0.0)
@@ -509,18 +805,18 @@ class SelfImprovingRAG:
             return "rerank"
         
         # Primary check: combined retrieval quality
-        if combined_score >= COMBINED_THRESHOLD:
+        if combined_score >= COMBINED_THRESHOLD or reward_signal >= COMBINED_THRESHOLD:
             print(f"✓ Retrieval acceptable (precision={context_precision:.3f}, "
-                  f"recall={context_recall:.3f}, combined={combined_score:.3f}); continuing to rerank")
+                  f"recall={context_recall:.3f}, combined={combined_score:.3f}, reward={reward_signal:.3f}); continuing to rerank")
             return "rerank"
         
         # Check precision (relevant contexts ranked highly)
-        if context_precision < PRECISION_THRESHOLD:
+        if context_precision < PRECISION_THRESHOLD and reward_signal < PRECISION_THRESHOLD:
             print(f"↻ Context precision too low ({context_precision:.3f}); retrying reformulation")
             return "reformulate_query"
         
         # Check recall (coverage of relevant information)
-        if context_recall < RECALL_THRESHOLD:
+        if context_recall < RECALL_THRESHOLD and reward_signal < RECALL_THRESHOLD:
             print(f"↻ Context recall too low ({context_recall:.3f}); retrying reformulation")
             return "reformulate_query"
         
@@ -538,6 +834,7 @@ class SelfImprovingRAG:
         rounds = state.get("rerank_round", 0)
         max_rounds = state.get("max_iterations", self.max_iterations)
         metrics = state.get("reranking_eval") or {}
+        reward_signal = self._latest_reward(state, "reranking") or 0.0
 
         # Get reranking quality metrics
         reranking_confidence = metrics.get("reranking_confidence", 0.0)
@@ -549,8 +846,8 @@ class SelfImprovingRAG:
             return "generate"
         
         # Primary check: overall reranking confidence
-        if reranking_confidence >= RERANKING_CONFIDENCE_THRESHOLD:
-            print(f"✓ Reranking acceptable (confidence={reranking_confidence:.3f}); continuing to generation")
+        if reranking_confidence >= RERANKING_CONFIDENCE_THRESHOLD or reward_signal >= RERANKING_CONFIDENCE_THRESHOLD:
+            print(f"✓ Reranking acceptable (confidence={reranking_confidence:.3f}, reward={reward_signal:.3f}); continuing to generation")
             return "generate"
         
         # Check if reranking actually improved things
@@ -576,19 +873,27 @@ class SelfImprovingRAG:
 
         rounds = state.get("generation_round", 0)
         max_rounds = state.get("max_iterations", self.max_iterations)
-        overall = state.get("overall_score", 0.0)
+        overall = state.get("overall_score") or 0.0
+        reward_signal = self._latest_reward(state, "generation") or 0.0
         
         # Get individual RAGAS generation metrics
-        faithfulness = state.get("faithfulness_score", 0.0)
-        answer_relevancy = state.get("answer_relevancy_score", 0.0)
+        faithfulness = state.get("faithfulness_score") or 0.0
+        answer_relevancy = (
+            state.get("answer_relevancy_score")
+            or state.get("answer_correctness_score")
+            or 0.0
+        )
 
+        if not overall:
+            overall = (faithfulness + answer_relevancy) / 2 if (faithfulness or answer_relevancy) else 0.0
+        
         if rounds >= max_rounds:
             print(f"✓ Generation reached max iterations ({rounds}/{max_rounds}); finishing")
             return END
         
-        if overall >= OVERALL_THRESHOLD:
+        if overall >= OVERALL_THRESHOLD or reward_signal >= OVERALL_THRESHOLD:
             print(f"✓ Generation met quality threshold (faithfulness={faithfulness:.3f}, "
-                  f"relevancy={answer_relevancy:.3f}, overall={overall:.3f}); finishing")
+                  f"relevancy={answer_relevancy:.3f}, overall={overall:.3f}, reward={reward_signal:.3f}); finishing")
             return END
         
         # Check if faithfulness is critically low
@@ -646,6 +951,7 @@ class SelfImprovingRAG:
             "retrieval_eval": None,
             "reranking_eval": None,
             "generation_eval": None,
+            "judge_eval": None,
             "prompt_history": [],
             "retrieval_round": 0,
             "rerank_round": 0,
@@ -659,8 +965,6 @@ class SelfImprovingRAG:
         thread_suffix: str = "",
     ) -> Dict[str, Any]:
         """Execute a compiled graph run and extract final outputs."""
-        self.prompt_optimizer.reset_active_records()
-
         thread_id = f"query-{hash(initial_state['query'])}{thread_suffix}"
         config = {"configurable": {"thread_id": thread_id}}
         final_state = None
@@ -681,7 +985,7 @@ class SelfImprovingRAG:
             print(f"{'='*80}")
             print(f"Iterations: {len(final_result.get('improvement_history', []))}")
             print(f"Final Answer: {final_result.get('answer', 'N/A')}")
-            print(f"Overall Score: {final_result.get('overall_score', 0.0):.3f}")
+            print(f"Overall Score: {(final_result.get('overall_score') or 0.0):.3f}")
             print(f"{'='*80}\n")
             
             return final_result
@@ -766,7 +1070,11 @@ class SelfImprovingRAG:
         final_k: int = 10,
         max_iterations: Optional[int] = None,
         convergence_threshold: Optional[float] = None,
-        concurrency: int = 1
+        concurrency: int = 1,
+        refresh_prompts: bool = False,
+        refresh_threshold: float = 0.6,
+        refresh_window: int = 5,
+        refresh_metric_fns: Optional[Dict[str, Callable[[Any, Any], float]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Process multiple queries with optional limited concurrency.
@@ -778,6 +1086,10 @@ class SelfImprovingRAG:
             max_iterations: Override default max iterations.
             convergence_threshold: Override default convergence threshold.
             concurrency: Max number of simultaneous graph runs (sharing the same prompt optimizer).
+            refresh_prompts: If True, refresh DSPy prompts between batches using observed rewards.
+            refresh_threshold: Mean reward threshold below which a refresh is triggered.
+            refresh_window: Number of recent rewards to consider for the refresh trigger.
+            refresh_metric_fns: Optional metric overrides for the DSPy optimizer during refresh.
         
         Returns:
             List of final states in the same order as the input queries.
@@ -826,6 +1138,14 @@ class SelfImprovingRAG:
             _run_single(idx, item) for idx, item in enumerate(queries)
         ])
 
+        if refresh_prompts:
+            self._refresh_prompts_from_results(
+                results,
+                threshold=refresh_threshold,
+                window=refresh_window,
+                metric_fns=refresh_metric_fns,
+            )
+
         return results
 
     def query_batch_sync(
@@ -835,7 +1155,11 @@ class SelfImprovingRAG:
         final_k: int = 10,
         max_iterations: Optional[int] = None,
         convergence_threshold: Optional[float] = None,
-        concurrency: int = 1
+        concurrency: int = 1,
+        refresh_prompts: bool = False,
+        refresh_threshold: float = 0.6,
+        refresh_window: int = 5,
+        refresh_metric_fns: Optional[Dict[str, Callable[[Any, Any], float]]] = None,
     ) -> List[Dict[str, Any]]:
         """Synchronous wrapper for query_batch()."""
         return asyncio.run(self.query_batch(
@@ -844,5 +1168,9 @@ class SelfImprovingRAG:
             final_k=final_k,
             max_iterations=max_iterations,
             convergence_threshold=convergence_threshold,
-            concurrency=concurrency
+            concurrency=concurrency,
+            refresh_prompts=refresh_prompts,
+            refresh_threshold=refresh_threshold,
+            refresh_window=refresh_window,
+            refresh_metric_fns=refresh_metric_fns,
         ))

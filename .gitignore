@@ -229,6 +229,6 @@ financebench_*.pkl
 *_metadata.pkl
 *_index.faiss
 
-# Demo outputs
-demo_outputs/
-sample_results/
+
+# Demo files
+demo/

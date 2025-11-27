@@ -52,19 +52,20 @@ class DocumentPreprocessor:
         self.embeddings = []
         self.bm25_index = None
         self.faiss_index = None
+        self.representative_queries = []
         
         # Contextualizer prompt based on Anthropic's research
-        self.contextualizer_prompt = """<document>
-{document}
-</document>
-
-Here is the chunk we want to situate within the whole document:
-<chunk>
-{chunk}
-</chunk>
-
-Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
-        
+        self.contextualizer_prompt = """
+        <document>
+        {document}
+        </document>
+        Here is the chunk we want to situate within the whole document:
+        <chunk>
+        {chunk}
+        </chunk>
+        Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else.
+        """
+                
     def chunk_text(self, text: str) -> List[str]:
         """
         Split text into overlapping chunks with improved boundary detection
@@ -282,6 +283,87 @@ Please give a short succinct context to situate this chunk within the overall do
         index.add(embeddings_array)
         
         return index
+
+    def get_representative_data(
+        self,
+        evaluation_queries: List[Dict[str, Any]],
+        hash_precision: int = 2,
+        hash_dims: int = 64,
+        max_per_bucket: int = 1
+    ) -> List[Dict[str, Any]]:
+        """
+        Use embedding hashing to pick representative queries for training.
+        
+        Args:
+            evaluation_queries: List of evaluation queries (str or dict with 'query').
+            hash_precision: Decimal precision for quantizing embeddings when hashing.
+            hash_dims: Number of leading dimensions to use for the hash.
+            max_per_bucket: Representatives to keep per hash bucket.
+        
+        Returns:
+            List of representative queries with clustering metadata.
+        """
+        if not evaluation_queries:
+            print("No evaluation queries provided for representative selection.")
+            return []
+
+        # Normalize inputs to plain text + optional metadata
+        query_texts: List[str] = []
+        query_meta: List[Dict[str, Any]] = []
+        for item in evaluation_queries:
+            query = item.get('query', '')
+            ground_truth = item.get('ground_truth', '')
+
+            query_texts.append(query)
+            query_meta.append({
+                "ground_truth": ground_truth,
+                # "metadata": extra_meta
+            })
+
+        if not query_texts:
+            print("No valid evaluation queries to process.")
+            return []
+
+        embeddings = self.generate_embeddings(query_texts)
+        embeddings_array = np.array(embeddings, dtype=np.float32)
+
+        if embeddings_array.size == 0:
+            print("Failed to compute embeddings for representative selection.")
+            return []
+
+        faiss.normalize_L2(embeddings_array)
+
+        dims_to_use = min(hash_dims, embeddings_array.shape[1])
+        scaling = 10 ** hash_precision
+
+        def hash_embedding(vec: np.ndarray) -> str:
+            quantized = np.round(vec[:dims_to_use] * scaling).astype(int)
+            return "|".join(map(str, quantized.tolist()))
+
+        buckets: Dict[str, List[int]] = {}
+        for idx, vec in enumerate(embeddings_array):
+            bucket_key = hash_embedding(vec)
+            buckets.setdefault(bucket_key, []).append(idx)
+
+        representatives: List[Dict[str, Any]] = []
+        for bucket_key, indices in buckets.items():
+            ranked = sorted(indices, key=lambda i: len(query_texts[i]), reverse=True)
+            for idx in ranked[:max_per_bucket]:
+                rep = {
+                    "query": query_texts[idx],
+                    "ground_truth": query_meta[idx].get("ground_truth"),
+                    "cluster_size": len(indices),
+                    "hash": bucket_key
+                }
+
+                if query_meta[idx].get("metadata"):
+                    rep["metadata"] = query_meta[idx]["metadata"]
+                    
+                representatives.append(rep)
+
+        self.representative_queries = representatives
+
+        return representatives
     
     def process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
         """
@@ -305,6 +387,7 @@ Please give a short succinct context to situate this chunk within the overall do
             
             # Create chunks
             chunks = self.chunk_text(text)
+            contextualized_chunks = chunks
             
             # Generate contextual information if enabled
             if use_context and chunks:
@@ -320,7 +403,7 @@ Please give a short succinct context to situate this chunk within the overall do
                     'chunk_id': chunk_idx,
                     'original_doc': doc,
                     'original_chunk': chunk,
-                    'contextualized_chunk': contextualized_chunk,
+                    'contextualized_chunk': contextualized_chunk if use_context else None,
                     'has_context': use_context
                 })
         
@@ -341,13 +424,8 @@ Please give a short succinct context to situate this chunk within the overall do
 
         print("Creating FAISS index...")
         self.faiss_index = self.create_faiss_index(self.embeddings)
-            
-        # Print contextual retrieval statistics
-        # if self.use_contextual_retrieval:
-        #     contextual_chunks = sum(1 for meta in chunk_metadata if meta['has_context'])
-        #     print(f"✅ Contextual Retrieval: {contextual_chunks}/{len(all_chunks)} chunks enhanced with context")
     
-    def save_index(self, index_path: str, metadata_path: str, use_context: bool = True) -> None:
+    def save_index(self, index_path: str, metadata_path: str) -> None:
         """
         Save the FAISS index and enhanced metadata to disk
         

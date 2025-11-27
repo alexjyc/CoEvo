@@ -1,43 +1,33 @@
 import os
 from typing import List, Dict, Any, Optional
 from langfuse import Langfuse
-# from langfuse.decorators import observe, langfuse_context
-# from langfuse.client import StatefulTraceClient
 
-# RAGAS imports
-from ragas.metrics import (
-    Faithfulness,
-    LLMContextPrecisionWithoutReference,
-    LLMContextRecall,
-    AnswerAccuracy
+# RAGAS imports (v0.2 collections API)
+from ragas.llms import llm_factory
+from ragas.embeddings import embedding_factory
+from ragas.metrics.collections import (
+    ContextPrecision,
+    ContextRecall,
+    AnswerCorrectness,
+    Faithfulness
 )
-from ragas.run_config import RunConfig
-from ragas.metrics.base import MetricWithLLM, MetricWithEmbeddings
-from ragas.dataset_schema import SingleTurnSample
-
-# LangChain wrappers for RAGAS
-from langchain_openai.chat_models import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai.embeddings import OpenAIEmbeddings
-from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
-
-
+from openai import AsyncOpenAI
 
 class Evaluator:
     """
-    Langfuse-integrated RAG evaluator using RAGAS metrics
+    RAG evaluator using RAGAS v0.2 metrics with llm_factory
+    
+    Metrics by stage:
+    - Retrieval: context_precision, context_recall
+    - Generation: faithfulness, answer_relevancy, context_utilization
     """
     
     def __init__(self, model: str = "gpt-4o-mini"):
         """
-        Initialize Langfuse RAG evaluator
+        Initialize RAG evaluator with RAGAS v0.2 collections API
         
         Args:
-            openai_api_key: OpenAI API key
-            langfuse_public_key: Langfuse public key (or from env)
-            langfuse_secret_key: Langfuse secret key (or from env)
-            langfuse_host: Langfuse host URL
+            model: Model to use for evaluation ("gpt-5-nano" "gpt-4o-mini" or "gemini-2.5-flash")
         """
         # Initialize Langfuse client
         self.langfuse = Langfuse(
@@ -46,65 +36,197 @@ class Evaluator:
             host=os.getenv("LANGFUSE_HOST")
         )
         
-        # Initialize RAGAS metrics
-        if model == "gpt-4o-mini":
-            self.llm = ChatOpenAI(api_key=os.getenv('OPENAI_API_KEY'), model="gpt-4o-mini", temperature=0)
-            self.embeddings = OpenAIEmbeddings(api_key=os.getenv('OPENAI_API_KEY'), model="text-embedding-3-small")
-        elif model == "gemini-2.5-flash":
-            self.llm = ChatGoogleGenerativeAI(google_api_key=os.getenv('GEMINI_API_KEY'), model="gemini-2.5-flash", temperature=0)
-            # Note: Replace with appropriate Gemini embeddings class when available
-            self.embeddings = OpenAIEmbeddings(api_key=os.getenv('OPENAI_API_KEY'), model="text-embedding-3-small")
+        # Initialize RAGAS evaluator LLM using llm_factory
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = model
+        self._setup_ragas_llm()
         self._setup_ragas_metrics()
     
-    def _setup_ragas_metrics(self):    
-        # Wrap for RAGAS
-        self.ragas_llm = LangchainLLMWrapper(self.llm)
-        self.ragas_embeddings = LangchainEmbeddingsWrapper(self.embeddings)
-        
-        # Define metrics
+    def _setup_ragas_llm(self):
+        """Setup evaluator LLM using RAGAS llm_factory"""
+        if self.model == "gpt-5-nano":
+            self.evaluator_llm = llm_factory(
+                model="gpt-5-nano",
+                client=self.client
+            )
+            self.evaluator_embeddings = embedding_factory(
+                model="text-embedding-3-small",
+                client=self.client
+            )
+        elif self.model == "gpt-4o-mini":
+            # Use llm_factory for OpenAI
+            self.evaluator_llm = llm_factory(
+                model="gpt-4o-mini",
+                client=self.client
+            )
+            # Embeddings for embedding-based metrics
+            self.evaluator_embeddings = embedding_factory(
+                model="text-embedding-3-small",
+                client=self.client
+            )
+        elif self.model == "gemini-2.5-flash":
+            # Use llm_factory for Gemini
+            self.evaluator_llm = llm_factory(
+                model="gemini-2.5-flash",
+                client=self.client
+            )
+            # Fallback to OpenAI embeddings for now
+            self.evaluator_embeddings = embedding_factory(
+                model="text-embedding-3-small",
+                client=self.client
+            )
+        else:
+            raise ValueError(f"Unsupported model: {self.model}")
+    
+    def _setup_ragas_metrics(self):
+        """Initialize RAGAS metrics with evaluator LLM"""
+        # Retrieval stage metrics (context_precision can work without reference)
         self.metrics = {
-            'faithfulness': Faithfulness(),
-            'answer_accuracy': AnswerAccuracy(),
-            'context_precision': LLMContextPrecisionWithoutReference(),
-            'context_recall': LLMContextRecall(),
-        }
-        
-        self._init_ragas_metrics()
-    
-    def _init_ragas_metrics(self):
-        """Initialize RAGAS metrics with LLM and embeddings"""
-        for metric in self.metrics.values():
-            if isinstance(metric, MetricWithLLM):
-                metric.llm = self.ragas_llm
-            if isinstance(metric, MetricWithEmbeddings):
-                metric.embeddings = self.ragas_embeddings
+            # Retrieval metrics - evaluate quality of retrieved contexts
+            'context_precision': ContextPrecision(llm=self.evaluator_llm),
+            'context_recall': ContextRecall(llm=self.evaluator_llm),
             
-            run_config = RunConfig()
-            metric.init(run_config)
+            # Generation metrics - evaluate quality of generated answer
+            'faithfulness': Faithfulness(llm=self.evaluator_llm),
+            'answer_correctness': AnswerCorrectness(
+                llm=self.evaluator_llm,
+                embeddings=self.evaluator_embeddings
+            )
+        }
     
-    async def evaluate_metrics(
-        self,
-        metric_keys: Optional[List[str]],
-        query: str,
-        contexts: List[str],
-        answer: str,
-        ground_truth: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Evaluate a configurable subset of metrics for the current trace."""
-        keys = metric_keys or list(self.metrics.keys())
-        print(f"Evaluating metrics: {keys}, query: {query}, contexts: {contexts}, answer: {answer}, ground_truth: {ground_truth}")
-        scores: Dict[str, Any] = {}
+    # async def evaluate_metrics(
+    #     self,
+    #     metric_keys: Optional[List[str]],
+    #     query: str,
+    #     contexts: List[str],
+    #     answer: str = "",
+    #     ground_truth: Optional[str] = None,
+    # ) -> Dict[str, float]:
+    #     """
+    #     Evaluate a configurable subset of RAGAS metrics
+        
+    #     Args:
+    #         metric_keys: List of metric names to evaluate (None = all)
+    #         query: User query/question
+    #         contexts: Retrieved contexts
+    #         answer: Generated answer (optional for retrieval-only evaluation)
+    #         ground_truth: Reference answer for evaluation
+    #         reference_contexts: Reference contexts for context recall
+        
+    #     Returns:
+    #         Dictionary mapping metric names to scores (0.0-1.0)
+    #     """
+    #     keys = metric_keys or list(self.metrics.keys())
+    #     print(f"  Evaluating RAGAS metrics: {keys}")
+    #     scores: Dict[str, float] = {}
+        
+    #     for key in keys:
+    #         metric = self.metrics.get(key)
+    #         if not metric:
+    #             print(f"    ⚠️  Metric '{key}' not found, skipping")
+    #             continue
+            
+    #         try:
+    #             score = await metric.ascore(
+    #                 user_input=query,
+    #                 retrieved_contexts=contexts,
+    #                 response=answer if answer else None,
+    #                 reference=ground_truth
+    #             )
+    #             scores[key] = float(score) if score is not None else 0.0
+    #             print(f"    ✓ {key}: {scores[key]:.3f}")
+                
+    #         except Exception as e:
+    #             print(f"    ✗ Error evaluating {key}: {e}")
+    #             scores[key] = 0.0
+        
+    #     return scores
+
+    async def evaluate_retrieval(self, query: str, contexts: List[str], ground_truth: Optional[str] = None) -> Dict[str, float]:
+        """
+        Evaluate retrieval quality using RAGAS metrics
+        """
+        keys = ['context_precision', 'context_recall']
+        print(f"  Evaluating RAGAS metrics: {keys}")
+        scores: Dict[str, float] = {}
+        
         for key in keys:
             metric = self.metrics.get(key)
             if not metric:
+                print(f"    ⚠️  Metric '{key}' not found, skipping")
                 continue
-            sample = SingleTurnSample(
-                user_input=query,
-                retrieved_contexts=contexts,
-                response=answer,
-                reference=ground_truth
-            )
-            scores[key] = await metric.single_turn_ascore(sample)
+            
+            try:
+                score = await metric.ascore(
+                    user_input=query,
+                    retrieved_contexts=contexts,
+                    reference=ground_truth
+                )
+                scores[key] = float(score) if score is not None else 0.0
+                print(f"    ✓ {key}: {scores[key]:.3f}")
+                
+            except Exception as e:
+                print(f"    ✗ Error evaluating {key}: {e}")
+                scores[key] = 0.0
+        
+        return scores
+
+    async def evaluate_reranking(self, query: str, contexts: List[str], ground_truth: Optional[str] = None) -> Dict[str, float]:
+        """
+        Evaluate reranking quality using RAGAS metrics
+        """
+        keys = ['context_precision']
+        print(f"  Evaluating RAGAS metrics: {keys}")
+        scores: Dict[str, float] = {}
+        
+        for key in keys:
+            metric = self.metrics.get(key)
+            if not metric:
+                print(f"    ⚠️  Metric '{key}' not found, skipping")
+                continue
+            
+            try:
+                score = await metric.ascore(
+                    user_input=query,
+                    retrieved_contexts=contexts,
+                    reference=ground_truth
+                )
+                scores[key] = float(score) if score is not None else 0.0
+                print(f"    ✓ {key}: {scores[key]:.3f}")
+                
+            except Exception as e:
+                print(f"    ✗ Error evaluating {key}: {e}")
+                scores[key] = 0.0
+        
+        return scores
+
+    async def evaluate_generation(self, query: str, contexts: List[str], answer: str, ground_truth: Optional[str] = None) -> Dict[str, float]:
+        """
+        Evaluate generation quality using RAGAS metrics
+        """
+        keys = ['faithfulness', 'answer_correctness']
+        print(f"  Evaluating RAGAS metrics: {keys}")
+        scores: Dict[str, float] = {}
+        for key in keys:
+            metric = self.metrics.get(key)
+            if not metric:
+                print(f"    ⚠️  Metric '{key}' not found, skipping")
+                continue
+            
+            try:
+                score = await metric.ascore(
+                    user_input=query,
+                    retrieved_contexts=contexts,
+                    response=answer,
+                    reference=ground_truth
+                )
+                scores[key] = float(score) if score is not None else 0.0
+                print(f"    ✓ {key}: {scores[key]:.3f}")
+                
+            except Exception as e:
+                print(f"    ✗ Error evaluating {key}: {e}")
+                scores[key] = 0.0
+        
         return scores
 
     async def evaluate_trace(
@@ -113,19 +235,26 @@ class Evaluator:
         contexts: List[str],
         answer: str,
         ground_truth: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, float]:
         """
-        Evaluate a single RAG interaction using the full set of RAGAS metrics
+        Evaluate a complete RAG trace using all RAGAS metrics
+        
+        This evaluates both retrieval and generation stages together.
+        
+        Args:
+            query: User query
+            contexts: Retrieved contexts
+            answer: Generated answer
+            ground_truth: Optional reference answer
+        
+        Returns:
+            Dict with all metric scores
         """
-        print("Evaluating single trace with RAGAS...")
-        try:
-            return await self.evaluate_metrics(
-                metric_keys=None,
-                query=query,
-                contexts=contexts,
-                answer=answer,
-                ground_truth=ground_truth
-            )
-        except Exception as e:
-            print(f"Error during RAGAS evaluation: {e}")
-            return {}
+        print("  Evaluating complete trace with RAGAS...")
+        return await self.evaluate_metrics(
+            metric_keys=None,  # Evaluate all metrics
+            query=query,
+            contexts=contexts,
+            answer=answer,
+            ground_truth=ground_truth
+        )

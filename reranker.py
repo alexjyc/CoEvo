@@ -1,5 +1,7 @@
-from typing import List, Dict, Any, Optional
-
+from typing import Callable, List, Dict, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
+from tqdm import tqdm
 from sentence_transformers import CrossEncoder
 
 
@@ -11,43 +13,138 @@ class Reranker:
         device: str = "mps",
         batch_size: int = 16,
         fusion_rrf_k: int = 60,
-        hybrid_dense_weight: float = 0.7
     ) -> None:
         self.model_name = model_name
         self.default_k = default_k
         self.batch_size = batch_size
         self.model = CrossEncoder(model_name, device=device)
         self.fusion_rrf_k = fusion_rrf_k
-        self.hybrid_dense_weight = self._sanitize_weight(hybrid_dense_weight)
 
-    @staticmethod
-    def _sanitize_weight(weight: float) -> float:
-        return max(0.0, min(1.0, float(weight)))
+    def optimize_fusion_params(
+            self, 
+            bm25_results: List[Dict[str, Any]],
+            dense_results: List[Dict[str, Any]],
+            top_k: int,
+            quality_fn: Callable[[List[Dict[str, Any]]], float], 
+            weight_candidates: List[float] = None
+    ) -> List[Dict[str, Any]]:
+            
+            if weight_candidates is None:
+                weight_candidates = [0.3, 0.5, 0.7, 0.9]
+            
+            if not weight_candidates:
+                raise ValueError("Must provide at least one weight candidate")
+            
+            def _test_single_weight(weight: float) -> Tuple[float, List[Dict[str, Any]], float]:
+                """
+                Test a single weight and return (weight, chunks, score).
+                This function is designed to be called in parallel.
+                """
+                try:
+                    # Fuse with this weight
+                    fused_chunks = self.rank_fusion(
+                        bm25_results=bm25_results,
+                        dense_results=dense_results,
+                        top_k=top_k,
+                        weight=weight,
+                        rrf_k=self.fusion_rrf_k
+                    )
+                    
+                    # Evaluate quality
+                    quality_metrics = quality_fn(fused_chunks)
+                    
+                    # Extract primary score (use first numeric value)
+                    score = None
+                    if isinstance(quality_metrics, dict):
+                        # Find first numeric metric
+                        for key, value in quality_metrics.items():
+                            if isinstance(value, (int, float)):
+                                score = float(value)
+                                break
+                        if score is None:
+                            raise ValueError(
+                                f"quality_fn must return dict with at least one numeric value. "
+                                f"Got: {quality_metrics}"
+                            )
+                    elif isinstance(quality_metrics, (int, float)):
+                        score = float(quality_metrics)
+                    else:
+                        raise ValueError(
+                            f"quality_fn must return dict or numeric value. "
+                            f"Got: {type(quality_metrics)}"
+                        )
+                    
+                    return weight, fused_chunks, score
+                    
+                except Exception as e:
+                    # Return error indicator
+                    print(f"Warning: Error testing weight {weight}: {e}")
+                    return weight, [], -1.0
+            
+            # Execute weight testing (parallel or sequential)
+            results = {}
+            quality_scores = {}
+            
+            if len(weight_candidates) > 1:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    future_to_weight = {
+                        executor.submit(_test_single_weight, weight): weight
+                        for weight in weight_candidates
+                    }
+                    
+                    with tqdm(total=len(weight_candidates), desc="Testing weights (parallel)") as pbar:
+                        for future in as_completed(future_to_weight):
+                            weight, chunks, score = future.result()
+                            if score >= 0:  # Valid result
+                                results[weight] = chunks
+                                quality_scores[weight] = score
+                            pbar.update(1)
+            else:
+                with tqdm(total=len(weight_candidates), desc="Testing weights (sequential)") as pbar:
+                    for weight in weight_candidates:
+                        weight, chunks, score = _test_single_weight(weight)
+                        if score >= 0:
+                            results[weight] = chunks
+                            quality_scores[weight] = score
+                        pbar.update(1)
+
+            if not quality_scores:
+                raise RuntimeError("All weight tests failed. Check quality_fn and inputs.")
+            
+            # Select best weight
+            best_weight = max(quality_scores, key=quality_scores.get)
+            best_chunks = results[best_weight]
+            
+            # Compute statistics
+            # scores_array = np.array(list(quality_scores.values()))
+            # details = {
+            #     "best_weight": float(best_weight),
+            #     "best_score": float(quality_scores[best_weight]),
+            #     "all_scores": {float(w): float(s) for w, s in quality_scores.items()},
+            #     "weight_stats": {
+            #         "mean": float(np.mean(scores_array)),
+            #         "std": float(np.std(scores_array)),
+            #         "min": float(np.min(scores_array)),
+            #         "max": float(np.max(scores_array)),
+            #         "range": float(np.ptp(scores_array))
+            #     },
+            #     "num_weights_tested": len(weight_candidates),
+            #     "execution_time": round(execution_time, 4),
+            # }
+            
+            return best_chunks
 
     def rank_fusion(
         self,
         bm25_results: List[Dict[str, Any]],
         dense_results: List[Dict[str, Any]],
-        k: int,
-        dense_weight: Optional[float] = None,
-        rrf_k: Optional[int] = None,
+        top_k: int,
+        weight: float,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
         """
         Fuse BM25 and dense retrieval outputs using Reciprocal Rank Fusion (RRF).
         """
-        bm25_results = bm25_results or []
-        dense_results = dense_results or []
-        if not bm25_results and not dense_results:
-            return []
-
-        weight = (
-            self._sanitize_weight(dense_weight)
-            if dense_weight is not None
-            else self.hybrid_dense_weight
-        )
-        rrf_k = rrf_k or self.fusion_rrf_k
-        bm25_weight = 1.0 - weight
-
         bm25_ranks = {item["chunk_index"]: rank for rank, item in enumerate(bm25_results)}
         dense_ranks = {item["chunk_index"]: rank for rank, item in enumerate(dense_results)}
         candidate_indices = set(bm25_ranks) | set(dense_ranks)
@@ -72,7 +169,7 @@ class Reranker:
         for idx in candidate_indices:
             score = 0.0
             if idx in bm25_ranks:
-                score += rrf(bm25_ranks[idx], bm25_weight)
+                score += rrf(bm25_ranks[idx], 1.0 - weight)
             if idx in dense_ranks:
                 score += rrf(dense_ranks[idx], weight)
             fusion_scores[idx] = score
@@ -99,11 +196,7 @@ class Reranker:
 
         fused.sort(key=lambda item: item["fusion_raw_score"], reverse=True)
 
-        limited = fused[:k]
-        for rank, item in enumerate(limited, start=1):
-            item["rank"] = rank
-
-        return limited
+        return fused[:top_k]
 
     def process_chunks(
         self,

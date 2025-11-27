@@ -22,7 +22,9 @@ class AnswerGenerationResponse(BaseModel):
 
 class LLMBase:
     def __init__(self, model_name: str = "gpt-4o-mini"):
-        if model_name == "gpt-4o-mini":
+        if model_name == "gpt-5-nano":
+            self.llm = ChatOpenAI(model=model_name, temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY"))
+        elif model_name == "gpt-4o-mini":
             self.llm = ChatOpenAI(model=model_name, temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY"))
         elif model_name == "gemini-2.5-flash":
             self.llm = ChatGoogleGenerativeAI(model=model_name, temperature=0, google_api_key=os.getenv("GEMINI_API_KEY"))
@@ -53,18 +55,6 @@ class LLMBase:
         ])
 
         return response
-    
-    # def synthesize_context(self, query: str, documents: list[str]) -> str:
-    #     prompt = self.get_model_prompt("context_synthesize").format(query=query)
-
-    #     structured_llm = self.llm.with_structured_output(ContextSynthesisResponse)
-
-    #     response = structured_llm.invoke([
-    #         {"role": "system", "content": prompt},
-    #         {"role": "user", "content": "\n\n".join(documents)}
-    #     ])
-
-    #     return response
     
     def generate_answer(self, query: str, context: str, prompt_override: str | None = None) -> str:
         prompt_template = prompt_override or self.get_model_prompt("answer_generation")
@@ -106,20 +96,6 @@ class LLMBase:
             Query: {query}
 
             Rank these documents by relevance (most relevant first):
-            """,
-            "context_synthesize": """
-            You are an expert at synthesizing information from multiple documents.
-            Your task is to create a comprehensive context that directly addresses the query.
-
-            Guidelines:
-            - Focus on information most relevant to the user's question
-            - Integrate information from multiple sources seamlessly
-            - Remove redundant or conflicting information
-            - Maintain factual accuracy and important details
-
-            Query: {query}
-
-            Synthesize the following retrieved documents:
             """,
             "answer_generation": """
             You are an AI assistant providing expert-level answers.

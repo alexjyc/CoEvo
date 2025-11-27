@@ -249,6 +249,7 @@ class PromptOptimizationCycle:
         self,
         state_snapshot: Dict[str, Any],
         stages: Optional[List[str]] = None,
+        memory: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         if not self.active_records:
             return []
@@ -268,20 +269,21 @@ class PromptOptimizationCycle:
         for record in to_finalize:
             stage = record["stage"]
             policy = self.policies[stage]
-            reward, breakdown = self._compute_reward(stage, state_snapshot)
+            reward, breakdown = self._compute_reward(stage, state_snapshot, memory or [])
             normalized_reward = policy.normalize_reward(reward)
             policy.update(record["action_index"], normalized_reward)
             enriched = dict(record)
             enriched["reward"] = reward
             enriched["normalized_reward"] = normalized_reward
             if stage == "reformulation":
+                # Reformulation stage rewards based on retrieval RAGAS metrics
                 retrieval_eval = state_snapshot.get("retrieval_eval") or {}
                 enriched["metrics_snapshot"] = {
-                    "retrieval_confidence": retrieval_eval.get("retrieval_confidence"),
-                    "top_score": retrieval_eval.get("top_score"),
-                    "agreement": retrieval_eval.get("bm25_dense_agreement"),
+                    "context_precision": retrieval_eval.get("context_precision"),
+                    "context_recall": retrieval_eval.get("context_recall"),
                 }
             elif stage == "reranking":
+                # Reranking stage still uses heuristics (no RAGAS metric for reranking)
                 reranking_eval = state_snapshot.get("reranking_eval") or {}
                 enriched["metrics_snapshot"] = {
                     "reranking_confidence": reranking_eval.get("reranking_confidence"),
@@ -289,20 +291,24 @@ class PromptOptimizationCycle:
                     "concentration": reranking_eval.get("score_concentration"),
                 }
             else:  # generation
+                # Generation stage rewards based on generation RAGAS metrics
+                generation_eval = state_snapshot.get("generation_eval") or {}
                 enriched["metrics_snapshot"] = {
-                    "faithfulness": state_snapshot.get("faithfulness_score"),
-                    "answer_accuracy": state_snapshot.get("answer_accuracy_score"),
-                    "context_precision": state_snapshot.get("context_precision_score"),
-                    "context_recall": state_snapshot.get("context_recall_score"),
-                    "overall": state_snapshot.get("overall_score"),
+                    "faithfulness": generation_eval.get("faithfulness"),
+                    "answer_correctness": generation_eval.get("answer_correctness"),
                 }
             enriched["reward_breakdown"] = breakdown
             finalized.append(enriched)
         self.history.extend(finalized)
         return finalized
 
-    def _compute_reward(self, stage: str, state_snapshot: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
-        """Derive the reward for a stage using only the LLM judge (fallbacks optional)."""
+    def _compute_reward(
+        self,
+        stage: str,
+        state_snapshot: Dict[str, Any],
+        memory: List[Dict[str, Any]],
+    ) -> Tuple[float, Dict[str, float]]:
+        """Derive the reward for a stage using judge + lightweight memory bonus."""
         reward_fn = self.stage_reward_fns.get(stage)
         fallback_reward = reward_fn(state_snapshot) if reward_fn else 0.0
         judge_result = self._evaluate_with_judge(stage, state_snapshot)
@@ -311,13 +317,34 @@ class PromptOptimizationCycle:
             judge_score = _normalize_score(judge_result.get("score"))
         else:
             judge_score = 0.0
-        total = max(min(judge_score if judge_result else fallback_reward, 1.0), -1.0)
+        base_reward = judge_score if judge_result else fallback_reward
+        memory_bonus = self._memory_bonus(memory)
+        total = max(min(base_reward + memory_bonus, 1.0), -1.0)
         breakdown = {
             "judge": judge_score,
             "fallback": fallback_reward if not judge_result else 0.0,
+            "memory": memory_bonus,
             "total": total,
         }
         return total, breakdown
+
+    def _memory_bonus(self, memory: List[Dict[str, Any]]) -> float:
+        """Use recent stage rewards from LangGraph memory to stabilize updates."""
+        if not memory:
+            return 0.0
+        recent = memory[-3:]
+        values: List[float] = []
+        for entry in recent:
+            norm = entry.get("normalized_reward")
+            if norm is not None:
+                values.append(norm)
+                continue
+            raw = entry.get("reward")
+            if raw is not None:
+                values.append(_normalize_score(raw))
+        if not values:
+            return 0.0
+        return sum(values) / len(values) * 0.15
 
     def _build_default_reward_fns(self) -> Dict[str, Callable[[Dict[str, Any]], float]]:
         """Provide optional fallback reward hooks; defaults return 0 to rely on the judge."""
@@ -472,14 +499,21 @@ class PromptOptimizationCycle:
 
     @staticmethod
     def _default_reward_fns() -> Dict[str, Callable[[Dict[str, Any]], float]]:
+        """
+        Default reward functions using RAGAS metrics
+        
+        - Reformulation: Rewarded by retrieval quality (context_precision + context_recall)
+        - Reranking: Rewarded by score improvement (heuristic-based)
+        - Generation: Rewarded by answer quality (faithfulness + answer_relevancy)
+        """
         return {
             "reformulation": lambda metrics: _safe_average(
-                [metrics.get("context_precision_score"), metrics.get("answer_accuracy_score")], fallback=0.0
+                [metrics.get("context_precision_score"), metrics.get("context_recall_score")], fallback=0.0
             ),
             "reranking": lambda metrics: _safe_average(
-                [metrics.get("faithfulness_score"), metrics.get("context_precision_score")], fallback=0.0
+                [metrics.get("reranking_eval", {}).get("score_improvement", 0.0)], fallback=0.0
             ),
             "generation": lambda metrics: _safe_average(
-                [metrics.get("faithfulness_score"), metrics.get("answer_accuracy_score")], fallback=0.0
+                [metrics.get("faithfulness_score"), metrics.get("answer_relevancy_score")], fallback=0.0
             ),
         }
