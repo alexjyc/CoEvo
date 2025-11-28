@@ -4,6 +4,7 @@ Implements iterative refinement based on evaluation feedback
 """
 
 import asyncio
+from itertools import chain
 from typing import Optional, List, Dict, Any, Annotated, Union, Tuple
 from typing_extensions import TypedDict as ExtendedTypedDict
 import operator
@@ -27,19 +28,16 @@ class RAGState(ExtendedTypedDict):
     query: str
     ground_truth: Optional[str]
     
-    # Reformation
-    reformulated_query: Optional[str]
-    reformation_rationale: Optional[str]
+    # Query Planning
+    sub_queries: Optional[List[str]]
     
     # Retrieval
     retrieved_chunks: Optional[List[Dict[str, Any]]]
     contexts: Optional[List[str]]
-    retrieval_method: Optional[str]
     
     # Reranking
     reranked_chunks: Optional[List[Dict[str, Any]]]
     final_contexts: Optional[List[str]]
-    reranking_rationale: Optional[str]
     
     # Generation
     answer: Optional[str]
@@ -85,8 +83,8 @@ class SelfImprovingRAG:
         self,
         chunk_size: int = 600,
         chunk_overlap: int = 50,
-        generation_model: str = "gemini-2.5-flash",
-        evaluator_model: str = "gemini-2.5-flash",
+        generation_model: str = "gpt-4o-mini",
+        evaluator_model: str = "gpt-4o-mini",
         temperature: float = 0,
         retrieval_method: str = "hybrid",
         max_iterations: int = 3,
@@ -209,59 +207,72 @@ class SelfImprovingRAG:
             "generation_round": 0
         }
     
-    def _reformulate_query_node(self, state: RAGState) -> Dict[str, Any]:
+    def _query_planner_node(self, state: RAGState) -> Dict[str, Any]:
         """Reformulate the query, potentially adjusting based on previous feedback"""
         print(f"\n[Iteration {state['iteration']}] Reformulating query...")
         
         query = state["query"]
         print(f"  Original Query: {query}")
-        prompt_text, prompt_record = self.prompt_optimizer.select_prompt(
-            stage="reformulation",
-            iteration_id=state["iteration"],
-            context={"query": query}
-        )
         
-        response = self.base_component.reformate_query(query, prompt_override=prompt_text)
-        print(f"  Reformulated Query: {response.reformatted_query}")
-        prompt_record["model_output"] = response.reformatted_query
-        prompt_record["rationale"] = response.rationale
+        response = self.base_component.query_planner(query)
+        print(f" Query Sub-Queries: {response.sub_queries}")
         
         return {
-            "reformulated_query": response.reformatted_query,
-            "reformation_rationale": response.rationale
+            "sub_queries": response.sub_queries
         }
     
-    def _retrieve_node(self, state: RAGState) -> Dict[str, Any]:
+    async def _retrieve_node(self, state: RAGState) -> Dict[str, Any]:
         """Retrieve documents, potentially adjusting k based on feedback"""
         print(f"[Iteration {state['iteration']}] Retrieving documents...")
         
-        effective_query = state["reformulated_query"]
+        original_query = state["query"]
+        sub_queries = state["sub_queries"]
         retrieval_k = state["retrieval_k"]
+        final_query = [original_query] + sub_queries
         
-        # Perform retrieval
-        retrieval_result = self.retriever.retrieve(
-            effective_query,
-            retrieval_k,
-            method=self.retrieval_method
-        )
-        
-        # Handle hybrid vs single method results
-        if isinstance(retrieval_result, dict) and self.retrieval_method == RetrievalMethod.HYBRID:
-            retrieved_chunks = self.reranker.optimize_fusion_params(
-                bm25_results=retrieval_result.get('bm25', []),
-                dense_results=retrieval_result.get('dense', []),
-                top_k=retrieval_k,
-                quality_fn=self._compute_retrieval_quality
+        async def fetch(query_text):
+            result = await asyncio.to_thread(
+                self.retriever.retrieve_hybrid,
+                query_text,
+                retrieval_k,
             )
-        else:
-            retrieved_chunks = retrieval_result
-        
-        contexts = [chunk['chunk_text'] for chunk in retrieved_chunks]
-        
+
+            chunks, details = self.reranker.optimize_fusion_params(
+                query=query_text,
+                bm25_results=result.get("bm25", []),
+                dense_results=result.get("dense", []),
+                top_k=retrieval_k,
+            )
+            
+            return {
+                "chunks": chunks,
+                "contexts": [c["chunk_text"] for c in chunks],
+                "weight_details": details,
+            }
+
+        sub_query_results = {}
+        tasks = [fetch(fq) for fq in final_query]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for fq, output in zip(final_query, results):
+            if isinstance(output, Exception):
+                print(f"  ⚠ Retrieval failed for '{fq}': {output}")
+                continue
+            sub_query_results[fq] = output
+
+        # TODO: find a optimal way to aggregate chunks from different sub-queries and next steps. 
+        # Current thought, either dive deeper into the sub-queries if more context is needed or aggregate reranking.
+        # How to decide which one to do? For ragas eval, calling generation this step with aggregated chunks good indicator?
+        combined_chunks = list(chain.from_iterable(
+            data["chunks"] for data in sub_query_results.values()
+        ))
+        combined_contexts = [chunk["chunk_text"] for chunk in combined_chunks]
+
         return {
-            "retrieved_chunks": retrieved_chunks,
-            "contexts": contexts,
-            "retrieval_method": self.retrieval_method.value
+            "sub_query_results": sub_query_results,
+            "retrieved_chunks": combined_chunks,
+            "contexts": combined_contexts,
+            "retrieval_method": self.retrieval_method.value,
         }
     
     def _rerank_node(self, state: RAGState) -> Dict[str, Any]:
@@ -430,8 +441,7 @@ class SelfImprovingRAG:
             return {"reranking_eval": None, "rerank_round": round_idx}
         
         contexts = [chunk['chunk_text'] for chunk in reranked_chunks]
-        score = await self.evaluator.evaluate_metrics(
-            metric_keys=['context_precision'],
+        score = await self.evaluator.evaluate_reranking(
             query=state["query"],
             contexts=contexts,
             ground_truth=state.get("ground_truth")
@@ -460,12 +470,11 @@ class SelfImprovingRAG:
         print(f"[Iteration {state['iteration']}] Evaluating generation output...")
         
         # Use RAGAS to evaluate generation (faithfulness, answer_relevancy, context_utilization)
-        scores = await self.evaluator.evaluate_metrics(
-            metric_keys=['faithfulness', 'answer_correctness'],
+        scores = await self.evaluator.evaluate_generation(
             query=state["query"],
             contexts=state.get("final_contexts") or [],
             answer=state.get("answer") or "",
-            ground_truth=state.get("ground_truth")
+            ground_truth=state.get("ground_truth")   
         )
         
         round_idx = state.get("generation_round", 0) + 1

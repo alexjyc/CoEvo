@@ -4,9 +4,11 @@ Implements Anthropic's Contextual Retrieval approach to improve chunk retrieval 
 Reference: https://www.anthropic.com/engineering/contextual-retrieval
 """
 
+from difflib import SequenceMatcher
 import os
 import numpy as np
 from typing import List, Dict, Any
+from sklearn.cluster import KMeans
 import faiss
 from openai import OpenAI
 from tqdm import tqdm
@@ -287,82 +289,81 @@ class DocumentPreprocessor:
     def get_representative_data(
         self,
         evaluation_queries: List[Dict[str, Any]],
-        hash_precision: int = 2,
-        hash_dims: int = 64,
-        max_per_bucket: int = 1
     ) -> List[Dict[str, Any]]:
-        """
-        Use embedding hashing to pick representative queries for training.
-        
-        Args:
-            evaluation_queries: List of evaluation queries (str or dict with 'query').
-            hash_precision: Decimal precision for quantizing embeddings when hashing.
-            hash_dims: Number of leading dimensions to use for the hash.
-            max_per_bucket: Representatives to keep per hash bucket.
-        
-        Returns:
-            List of representative queries with clustering metadata.
-        """
-        if not evaluation_queries:
-            print("No evaluation queries provided for representative selection.")
-            return []
-
-        # Normalize inputs to plain text + optional metadata
-        query_texts: List[str] = []
-        query_meta: List[Dict[str, Any]] = []
-        for item in evaluation_queries:
-            query = item.get('query', '')
-            ground_truth = item.get('ground_truth', '')
-
-            query_texts.append(query)
-            query_meta.append({
-                "ground_truth": ground_truth,
-                # "metadata": extra_meta
-            })
-
-        if not query_texts:
-            print("No valid evaluation queries to process.")
-            return []
-
+        query_texts = [q['query'] for q in evaluation_queries]
         embeddings = self.generate_embeddings(query_texts)
         embeddings_array = np.array(embeddings, dtype=np.float32)
-
-        if embeddings_array.size == 0:
-            print("Failed to compute embeddings for representative selection.")
-            return []
-
         faiss.normalize_L2(embeddings_array)
+        
+        # Cluster
+        inertias = []
+        
+        for k in tqdm(range(5, min(30, len(query_texts)))):
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(embeddings_array)
+            inertias.append(kmeans.inertia_)
 
-        dims_to_use = min(hash_dims, embeddings_array.shape[1])
-        scaling = 10 ** hash_precision
+        deltas = np.diff(inertias)
+        second_deltas = np.diff(deltas)
+        if len(deltas) > 1:
+            second_deltas = np.diff(deltas)
+            elbow_idx = np.argmax(second_deltas) + 5 + 1
+            n_representatives = elbow_idx
+        else:
+            n_representatives = 5
 
-        def hash_embedding(vec: np.ndarray) -> str:
-            quantized = np.round(vec[:dims_to_use] * scaling).astype(int)
-            return "|".join(map(str, quantized.tolist()))
+        n_clusters = min(n_representatives, len(query_texts))
+        print(f"\n⏳ Clustering into {n_clusters} groups...")
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings_array)
+                
+        # Select representative from each cluster
+        representatives = []
+        for i in range(n_clusters):
+            cluster_mask = labels == i
+            cluster_indices = np.where(cluster_mask)[0]
+            cluster_embeddings = embeddings_array[cluster_indices]
+            
+            # Find closest to centroid
+            centroid = kmeans.cluster_centers_[i]
+            distances = np.linalg.norm(cluster_embeddings - centroid, axis=1)
+            rep_idx = cluster_indices[np.argmin(distances)]
 
-        buckets: Dict[str, List[int]] = {}
-        for idx, vec in enumerate(embeddings_array):
-            bucket_key = hash_embedding(vec)
-            buckets.setdefault(bucket_key, []).append(idx)
+            # sorted_order = np.argsort(distances)
+            # sorted_indices = cluster_indices[sorted_order]
+            # sorted_distances = distances[sorted_order]
 
-        representatives: List[Dict[str, Any]] = []
-        for bucket_key, indices in buckets.items():
-            ranked = sorted(indices, key=lambda i: len(query_texts[i]), reverse=True)
-            for idx in ranked[:max_per_bucket]:
-                rep = {
-                    "query": query_texts[idx],
-                    "ground_truth": query_meta[idx].get("ground_truth"),
-                    "cluster_size": len(indices),
-                    "hash": bucket_key
-                }
+            # print(f"CLUSTER {i+1}/{n_clusters}")
 
-                if query_meta[idx].get("metadata"):
-                    rep["metadata"] = query_meta[idx]["metadata"]
+            # rep_query = query_texts[rep_idx]
+            # print(f"\n⭐ REPRESENTATIVE (closest to centroid):")
+            # print(f"   {rep_query}")
+            # if evaluation_queries[rep_idx].get('ground_truth'):
+            #     gt = evaluation_queries[rep_idx]['ground_truth']
+            #     gt_preview = (gt[:80] + "...") if len(gt) > 80 else gt
+            #     print(f"   GT: {gt_preview}")
+
+            # print(f"\n📋 ALL QUERIES IN THIS CLUSTER (sorted by similarity to centroid):")
+            # for rank, (idx, dist) in enumerate(zip(sorted_indices, sorted_distances), 1):
+            #     query = query_texts[idx]
+            #     marker = "⭐" if idx == rep_idx else "  "
+                
+            #     # Truncate long queries
+            #     if len(query) > 75:
+            #         query_display = query[:75] + "..."
+            #     else:
+            #         query_display = query
+                
+            #     print(f"   {marker} {rank:2d}. [dist: {dist:.3f}] {query_display}")
                     
-                representatives.append(rep)
-
-        self.representative_queries = representatives
-
+            
+            representatives.append({
+                "query": query_texts[rep_idx],
+                "ground_truth": evaluation_queries[rep_idx].get('ground_truth'),
+                "cluster_size": len(cluster_indices),
+                "cluster_id": i
+            })
+        
         return representatives
     
     def process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
@@ -424,6 +425,94 @@ class DocumentPreprocessor:
 
         print("Creating FAISS index...")
         self.faiss_index = self.create_faiss_index(self.embeddings)
+
+    
+    def create_relevance_labels(
+        self,
+        evaluation_queries: List[Dict[str, Any]],
+        overlap_threshold: float = 0.6
+    ) -> Dict[int, List[int]]:
+        print(f"Creating precise relevance labels for {len(evaluation_queries)} queries...")
+        
+        relevance_labels = {}
+        
+        for query in tqdm(evaluation_queries, desc="Creating labels"):
+            query_id = query['query_id']
+            reference_evidence_texts = query.get('reference_evidence_texts', [])
+            
+            relevant_chunk_indices = []
+            
+            # For each chunk, check if it overlaps with any evidence snippet
+            for chunk_idx, meta in enumerate(self.chunk_metadata):
+                chunk_text = meta['original_chunk']
+                chunk_doc_id = meta['doc_id']
+                
+                for evidence_info in reference_evidence_texts:
+                    if chunk_doc_id != evidence_info['doc_id']:
+                        continue
+                    
+                    evidence_text = evidence_info['evidence_text']
+                    
+                    # Calculate overlap between chunk and evidence
+                    overlap_ratio = self._calculate_text_overlap(chunk_text, evidence_text)
+                    
+                    if overlap_ratio >= overlap_threshold:
+                        relevant_chunk_indices.append(chunk_idx)
+                        break  # Don't double-count same chunk
+            
+            relevance_labels[query_id] = relevant_chunk_indices
+        
+        # Print statistics
+        total_relevant = sum(len(v) for v in relevance_labels.values())
+        avg_relevant = total_relevant / len(relevance_labels) if relevance_labels else 0
+        
+        print(f"Created relevance labels:")
+        print(f"  - Total relevant chunks: {total_relevant}")
+        print(f"  - Average relevant chunks per query: {avg_relevant:.1f}")
+        print(f"  - Total chunks in corpus: {len(self.chunk_metadata)}")
+        print(f"  - Relevance ratio: {total_relevant / len(self.chunk_metadata) / len(relevance_labels):.2%}")
+        
+        return relevance_labels
+
+    
+    def _calculate_text_overlap(self, chunk_text: str, evidence_text: str) -> float:
+        """Calculate overlap with fuzzy matching support"""
+        
+        chunk_lower = chunk_text.lower()
+        evidence_lower = evidence_text.lower()
+        
+        # Exact containment (best case)
+        if evidence_lower in chunk_lower:
+            return 1.0
+        
+        # Fuzzy subsequence matching (handles small variations)
+        # Split evidence into sentences/segments
+        evidence_segments = [s.strip() for s in evidence_lower.split('.') if s.strip()]
+        
+        max_overlap = 0.0
+        for segment in evidence_segments:
+            if not segment:
+                continue
+            
+            # Find best fuzzy match in chunk
+            matcher = SequenceMatcher(None, segment, chunk_lower)
+            match = matcher.find_longest_match(0, len(segment), 0, len(chunk_lower))
+            
+            if match.size > 0:
+                segment_overlap = match.size / len(segment)
+                max_overlap = max(max_overlap, segment_overlap)
+        
+        # Fallback to token overlap
+        if max_overlap < 0.3:
+            chunk_tokens = set(self.tokenize_text(chunk_text))
+            evidence_tokens = set(self.tokenize_text(evidence_text))
+            
+            if evidence_tokens:
+                overlap_tokens = chunk_tokens & evidence_tokens
+                max_overlap = max(max_overlap, len(overlap_tokens) / len(evidence_tokens))
+        
+        return max_overlap
+
     
     def save_index(self, index_path: str, metadata_path: str) -> None:
         """

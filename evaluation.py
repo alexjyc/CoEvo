@@ -5,12 +5,14 @@ from langfuse import Langfuse
 # RAGAS imports (v0.2 collections API)
 from ragas.llms import llm_factory
 from ragas.embeddings import embedding_factory
+from ragas import SingleTurnSample
 from ragas.metrics.collections import (
     ContextPrecision,
     ContextRecall,
     AnswerCorrectness,
     Faithfulness
 )
+from ragas.metrics import IDBasedContextPrecision, IDBasedContextRecall
 from openai import AsyncOpenAI
 
 class Evaluator:
@@ -83,6 +85,10 @@ class Evaluator:
         # Retrieval stage metrics (context_precision can work without reference)
         self.metrics = {
             # Retrieval metrics - evaluate quality of retrieved contexts
+            'id_based_context_precision': IDBasedContextPrecision(),
+            'id_based_context_recall': IDBasedContextRecall(),
+
+            # Reranking metrics - evaluate quality of reranked contexts
             'context_precision': ContextPrecision(llm=self.evaluator_llm),
             'context_recall': ContextRecall(llm=self.evaluator_llm),
             
@@ -93,60 +99,12 @@ class Evaluator:
                 embeddings=self.evaluator_embeddings
             )
         }
-    
-    # async def evaluate_metrics(
-    #     self,
-    #     metric_keys: Optional[List[str]],
-    #     query: str,
-    #     contexts: List[str],
-    #     answer: str = "",
-    #     ground_truth: Optional[str] = None,
-    # ) -> Dict[str, float]:
-    #     """
-    #     Evaluate a configurable subset of RAGAS metrics
-        
-    #     Args:
-    #         metric_keys: List of metric names to evaluate (None = all)
-    #         query: User query/question
-    #         contexts: Retrieved contexts
-    #         answer: Generated answer (optional for retrieval-only evaluation)
-    #         ground_truth: Reference answer for evaluation
-    #         reference_contexts: Reference contexts for context recall
-        
-    #     Returns:
-    #         Dictionary mapping metric names to scores (0.0-1.0)
-    #     """
-    #     keys = metric_keys or list(self.metrics.keys())
-    #     print(f"  Evaluating RAGAS metrics: {keys}")
-    #     scores: Dict[str, float] = {}
-        
-    #     for key in keys:
-    #         metric = self.metrics.get(key)
-    #         if not metric:
-    #             print(f"    ⚠️  Metric '{key}' not found, skipping")
-    #             continue
-            
-    #         try:
-    #             score = await metric.ascore(
-    #                 user_input=query,
-    #                 retrieved_contexts=contexts,
-    #                 response=answer if answer else None,
-    #                 reference=ground_truth
-    #             )
-    #             scores[key] = float(score) if score is not None else 0.0
-    #             print(f"    ✓ {key}: {scores[key]:.3f}")
-                
-    #         except Exception as e:
-    #             print(f"    ✗ Error evaluating {key}: {e}")
-    #             scores[key] = 0.0
-        
-    #     return scores
 
-    async def evaluate_retrieval(self, query: str, contexts: List[str], ground_truth: Optional[str] = None) -> Dict[str, float]:
+    async def evaluate_retrieval(self, retrieved_contexts: List[str], reference_contexts: List[str]) -> Dict[str, float]:
         """
         Evaluate retrieval quality using RAGAS metrics
         """
-        keys = ['context_precision', 'context_recall']
+        keys = ['id_based_context_precision', 'id_based_context_recall']
         print(f"  Evaluating RAGAS metrics: {keys}")
         scores: Dict[str, float] = {}
         
@@ -157,11 +115,11 @@ class Evaluator:
                 continue
             
             try:
-                score = await metric.ascore(
-                    user_input=query,
-                    retrieved_contexts=contexts,
-                    reference=ground_truth
+                sample = SingleTurnSample(
+                    retrieved_context_ids=retrieved_contexts,
+                    reference_context_ids=reference_contexts
                 )
+                score = await metric.single_turn_ascore(sample)
                 scores[key] = float(score) if score is not None else 0.0
                 print(f"    ✓ {key}: {scores[key]:.3f}")
                 

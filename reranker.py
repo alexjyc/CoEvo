@@ -1,8 +1,10 @@
+import hashlib
 from typing import Callable, List, Dict, Any, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 import numpy as np
 from tqdm import tqdm
 from sentence_transformers import CrossEncoder
+from evaluation import Evaluator
 
 
 class Reranker:
@@ -19,25 +21,44 @@ class Reranker:
         self.batch_size = batch_size
         self.model = CrossEncoder(model_name, device=device)
         self.fusion_rrf_k = fusion_rrf_k
+        self.query_id_map = {}
+        self.relevance_labels = {}
+        self.evaluator = Evaluator()
 
-    def optimize_fusion_params(
+
+    def set_relevance_labels(self, evaluation_queries: List[Dict[str, Any]], relevance_labels: Dict[int, List[int]]) -> None:
+        self.relevance_labels = relevance_labels
+        self.query_id_map = { self._hash_query(q['query']): q['query_id'] for q in evaluation_queries }
+
+    @staticmethod
+    def _hash_query(query: str) -> str:
+        normalized = ' '.join(query.lower().strip().split())
+
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    async def optimize_fusion_params(
             self, 
+            query: str,
             bm25_results: List[Dict[str, Any]],
             dense_results: List[Dict[str, Any]],
             top_k: int,
-            quality_fn: Callable[[List[Dict[str, Any]]], float], 
             weight_candidates: List[float] = None
     ) -> List[Dict[str, Any]]:
             
             if weight_candidates is None:
-                weight_candidates = [0.3, 0.5, 0.7, 0.9]
+                weight_candidates = [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]
             
             if not weight_candidates:
                 raise ValueError("Must provide at least one weight candidate")
-            
-            def _test_single_weight(weight: float) -> Tuple[float, List[Dict[str, Any]], float]:
+
+            query_id = self.query_id_map.get(self._hash_query(query))
+
+            if query_id is None:
+                raise ValueError(f"Query ID not found for query: {query}")
+
+            async def _test_single_weight(weight: float) -> Tuple[float, List[Dict[str, Any]], float, float]:
                 """
-                Test a single weight and return (weight, chunks, score).
+                Test a single weight and return (weight, chunks, precision, recall).
                 This function is designed to be called in parallel.
                 """
                 try:
@@ -50,63 +71,47 @@ class Reranker:
                         rrf_k=self.fusion_rrf_k
                     )
                     
+                    # Extract contexts from chunks for evaluation
+                    contexts = [chunk.get("chunk_index", "") for chunk in fused_chunks]
+                    print(f"Contexts: {contexts}")  
+                    print(f"Relevance labels: {self.relevance_labels[query_id]}")
+                    
                     # Evaluate quality
-                    quality_metrics = quality_fn(fused_chunks)
-                    
-                    # Extract primary score (use first numeric value)
-                    score = None
-                    if isinstance(quality_metrics, dict):
-                        # Find first numeric metric
-                        for key, value in quality_metrics.items():
-                            if isinstance(value, (int, float)):
-                                score = float(value)
-                                break
-                        if score is None:
-                            raise ValueError(
-                                f"quality_fn must return dict with at least one numeric value. "
-                                f"Got: {quality_metrics}"
-                            )
-                    elif isinstance(quality_metrics, (int, float)):
-                        score = float(quality_metrics)
-                    else:
-                        raise ValueError(
-                            f"quality_fn must return dict or numeric value. "
-                            f"Got: {type(quality_metrics)}"
-                        )
-                    
-                    return weight, fused_chunks, score
+                    quality_metrics = await self.evaluator.evaluate_retrieval(
+                        retrieved_contexts=contexts,
+                        reference_contexts=self.relevance_labels[query_id]
+                    )
+
+                    precision = quality_metrics.get("retrieval_context_precision", 0.0)
+                    recall = quality_metrics.get("retrieval_context_recall", 0.0)
+
+                    return weight, fused_chunks, precision, recall
                     
                 except Exception as e:
                     # Return error indicator
                     print(f"Warning: Error testing weight {weight}: {e}")
-                    return weight, [], -1.0
+                    return weight, [], -1.0, -1.0
             
-            # Execute weight testing (parallel or sequential)
+            # Execute weight testing with asyncio
             results = {}
             quality_scores = {}
             
-            if len(weight_candidates) > 1:
-                with ThreadPoolExecutor(max_workers=4) as executor:
-                    future_to_weight = {
-                        executor.submit(_test_single_weight, weight): weight
-                        for weight in weight_candidates
-                    }
-                    
-                    with tqdm(total=len(weight_candidates), desc="Testing weights (parallel)") as pbar:
-                        for future in as_completed(future_to_weight):
-                            weight, chunks, score = future.result()
-                            if score >= 0:  # Valid result
-                                results[weight] = chunks
-                                quality_scores[weight] = score
-                            pbar.update(1)
-            else:
-                with tqdm(total=len(weight_candidates), desc="Testing weights (sequential)") as pbar:
-                    for weight in weight_candidates:
-                        weight, chunks, score = _test_single_weight(weight)
-                        if score >= 0:
-                            results[weight] = chunks
-                            quality_scores[weight] = score
-                        pbar.update(1)
+            # Create tasks for all weights
+            tasks = [_test_single_weight(weight) for weight in weight_candidates]
+            
+            # Execute all tasks concurrently with progress bar
+            with tqdm(total=len(weight_candidates), desc="Testing weights (async)") as pbar:
+                for coro in asyncio.as_completed(tasks):
+                    weight, chunks, precision, recall = await coro
+                    if precision >= 0 and recall >= 0:  # Valid result
+                        # Calculate F1 score from precision and recall
+                        if precision + recall > 0:
+                            f1_score = 2 * (precision * recall) / (precision + recall)
+                        else:
+                            f1_score = 0.0
+                        results[weight] = chunks
+                        quality_scores[weight] = f1_score
+                    pbar.update(1)
 
             if not quality_scores:
                 raise RuntimeError("All weight tests failed. Check quality_fn and inputs.")
@@ -114,23 +119,6 @@ class Reranker:
             # Select best weight
             best_weight = max(quality_scores, key=quality_scores.get)
             best_chunks = results[best_weight]
-            
-            # Compute statistics
-            # scores_array = np.array(list(quality_scores.values()))
-            # details = {
-            #     "best_weight": float(best_weight),
-            #     "best_score": float(quality_scores[best_weight]),
-            #     "all_scores": {float(w): float(s) for w, s in quality_scores.items()},
-            #     "weight_stats": {
-            #         "mean": float(np.mean(scores_array)),
-            #         "std": float(np.std(scores_array)),
-            #         "min": float(np.min(scores_array)),
-            #         "max": float(np.max(scores_array)),
-            #         "range": float(np.ptp(scores_array))
-            #     },
-            #     "num_weights_tested": len(weight_candidates),
-            #     "execution_time": round(execution_time, 4),
-            # }
             
             return best_chunks
 

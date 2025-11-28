@@ -623,16 +623,16 @@ class DSPYRAG:
         feedback = None
         precision = scores.get("context_precision", 0.0)
         recall = scores.get("context_recall", 0.0)
-        if precision < 0.6 or recall < 0.6:
-            import re
+        # if precision < 0.6 or recall < 0.6:
+        #     import re
 
-            q_terms = set(re.findall(r"[A-Z][A-Za-z0-9\-]+", state["query"]))
-            ctx_blob = " ".join(contexts)
-            missing = [t for t in q_terms if t not in ctx_blob]
-            parts = [f"precision={precision:.2f}", f"recall={recall:.2f}"]
-            if missing:
-                parts.append(f"missing: {', '.join(missing[:5])}")
-            feedback = "; ".join(parts)
+        #     q_terms = set(re.findall(r"[A-Z][A-Za-z0-9\-]+", state["query"]))
+        #     ctx_blob = " ".join(contexts)
+        #     missing = [t for t in q_terms if t not in ctx_blob]
+        #     parts = [f"precision={precision:.2f}", f"recall={recall:.2f}"]
+        #     if missing:
+        #         parts.append(f"missing: {', '.join(missing[:5])}")
+        #     feedback = "; ".join(parts)
         
         judge_update: Dict[str, Any] = {}
         if getattr(self.prompter, "judge", None) and getattr(self.prompter.judge, "enabled", False):
