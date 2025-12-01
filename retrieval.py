@@ -177,34 +177,3 @@ class Retriever:
             "bm25": bm25_results,
             "dense": dense_results,
         }
-
-    # def retrieve(self, query: str, k: int = 50, 
-    #             method: Optional[RetrievalMethod] = None,
-    #             **kwargs) -> Union[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
-    #     """
-    #     Main retrieval method that dispatches to specific retrieval methods
-        
-    #     Args:
-    #         query: Query string
-    #         k: Number of chunks to retrieve
-    #         method: Retrieval method to use (defaults to self.default_method)
-    #         **kwargs: Additional arguments for specific retrieval methods
-            
-    #     Returns:
-    #         List of retrieved chunks
-    #     """
-        
-    #     print(f"Retrieving with method: {method.value}")
-        
-    #     if method == RetrievalMethod.BM25_ONLY:
-    #         return self.retrieve_bm25(query, k)
-    #     elif method == RetrievalMethod.DENSE_ONLY:
-    #         return self.retrieve_dense(query, k)
-    #     elif method == RetrievalMethod.HYBRID:
-    #         bm25_k = kwargs.get("bm25_k", k)
-    #         dense_k = kwargs.get("dense_k", k)
-    #         return self.retrieve_hybrid(query, bm25_k=bm25_k, dense_k=dense_k)
-    #     else:
-    #         raise ValueError(f"Unknown retrieval method: {method}")
-        
-    

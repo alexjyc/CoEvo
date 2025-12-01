@@ -232,3 +232,13 @@ financebench_*.pkl
 
 # Demo files
 demo/
+
+# GEPA files
+gepa_training_data/
+gepa_optimization/
+gepa_optimization_results/
+gepa_optimization_results_*/
+gepa_optimization_results_*/
+
+# Tbd files
+clean/

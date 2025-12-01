@@ -383,6 +383,7 @@ class DocumentPreprocessor:
         
         for doc_idx, doc in enumerate(documents):
             text = doc.get('text', '')
+            doc_id = doc.get('doc_id', '')
             
             print(f"Processing document {doc_idx + 1}/{len(documents)}...")
             
@@ -400,7 +401,7 @@ class DocumentPreprocessor:
                 all_contextualized_chunks.append(contextualized_chunk)
                 
                 chunk_metadata.append({
-                    'doc_id': doc_idx,
+                    'doc_id': doc_id,
                     'chunk_id': chunk_idx,
                     'original_doc': doc,
                     'original_chunk': chunk,
@@ -430,7 +431,7 @@ class DocumentPreprocessor:
     def create_relevance_labels(
         self,
         evaluation_queries: List[Dict[str, Any]],
-        overlap_threshold: float = 0.6
+        overlap_threshold: float = 0.5
     ) -> Dict[int, List[int]]:
         print(f"Creating precise relevance labels for {len(evaluation_queries)} queries...")
         
@@ -448,12 +449,11 @@ class DocumentPreprocessor:
                 chunk_doc_id = meta['doc_id']
                 
                 for evidence_info in reference_evidence_texts:
+
                     if chunk_doc_id != evidence_info['doc_id']:
                         continue
                     
                     evidence_text = evidence_info['evidence_text']
-                    
-                    # Calculate overlap between chunk and evidence
                     overlap_ratio = self._calculate_text_overlap(chunk_text, evidence_text)
                     
                     if overlap_ratio >= overlap_threshold:

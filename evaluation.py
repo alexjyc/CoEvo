@@ -129,11 +129,11 @@ class Evaluator:
         
         return scores
 
-    async def evaluate_reranking(self, query: str, contexts: List[str], ground_truth: Optional[str] = None) -> Dict[str, float]:
+    async def evaluate_llm(self, query: str, contexts: List[str], ground_truth: Optional[str] = None) -> Dict[str, float]:
         """
-        Evaluate reranking quality using RAGAS metrics
+        Evaluate LLM quality using RAGAS metrics
         """
-        keys = ['context_precision']
+        keys = ['context_precision', 'context_recall']
         print(f"  Evaluating RAGAS metrics: {keys}")
         scores: Dict[str, float] = {}
         

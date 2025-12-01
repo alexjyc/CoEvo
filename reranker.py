@@ -1,4 +1,5 @@
 import hashlib
+import re
 from typing import Callable, List, Dict, Any, Optional, Tuple
 import asyncio
 import numpy as np
@@ -54,7 +55,14 @@ class Reranker:
             query_id = self.query_id_map.get(self._hash_query(query))
 
             if query_id is None:
-                raise ValueError(f"Query ID not found for query: {query}")
+                print(f"⚠️  No relevance labels for query: {query}, using default weight=0.5")
+                return self.rank_fusion(
+                    bm25_results=bm25_results,
+                    dense_results=dense_results,
+                    top_k=top_k,
+                    weight=0.5,
+                    rrf_k=self.fusion_rrf_k
+                )
 
             async def _test_single_weight(weight: float) -> Tuple[float, List[Dict[str, Any]], float, float]:
                 """
@@ -72,13 +80,17 @@ class Reranker:
                     )
                     
                     # Extract contexts from chunks for evaluation
-                    contexts = [chunk.get("chunk_index", "") for chunk in fused_chunks]
-                    print(f"Contexts: {contexts}")  
+                    retrieved_indices = [
+                        chunk["chunk_index"] 
+                        for chunk in fused_chunks 
+                        if "chunk_index" in chunk and isinstance(chunk["chunk_index"], (int, np.integer))
+                    ]
+                    print(f"Contexts: {retrieved_indices}")  
                     print(f"Relevance labels: {self.relevance_labels[query_id]}")
                     
                     # Evaluate quality
                     quality_metrics = await self.evaluator.evaluate_retrieval(
-                        retrieved_contexts=contexts,
+                        retrieved_contexts=retrieved_indices,
                         reference_contexts=self.relevance_labels[query_id]
                     )
 
@@ -135,6 +147,8 @@ class Reranker:
         """
         bm25_ranks = {item["chunk_index"]: rank for rank, item in enumerate(bm25_results)}
         dense_ranks = {item["chunk_index"]: rank for rank, item in enumerate(dense_results)}
+        print(f"BM25 ranks: {bm25_ranks}")
+        print(f"Dense ranks: {dense_ranks}")
         candidate_indices = set(bm25_ranks) | set(dense_ranks)
         if not candidate_indices:
             return []
