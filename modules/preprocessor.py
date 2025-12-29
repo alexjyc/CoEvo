@@ -4,7 +4,6 @@ Implements Anthropic's Contextual Retrieval approach to improve chunk retrieval 
 Reference: https://www.anthropic.com/engineering/contextual-retrieval
 """
 
-from difflib import SequenceMatcher
 import os
 import numpy as np
 from typing import List, Dict, Any
@@ -17,23 +16,39 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rank_bm25 import BM25Okapi
 import re
 
+def generate_chunk_id(doc_id: str, chunk_index: int) -> str:
+    """
+    Generate a unique chunk-level ID.
+
+    Format: {doc_id}_chunk_{chunk_index:02d}
+    Example: doc_manual_v1_chunk_05
+
+    This provides:
+    - Traceability: Can identify source document
+    - Uniqueness: Combination of doc_id and chunk index
+    - Industry-standard: Chunk-level granularity for relevance
+    """
+    return f"{doc_id}_chunk_{chunk_index:02d}"
+
+
 class DocumentPreprocessor:
     """
     Enhanced document preprocessor with Contextual Retrieval support
-    Adds context to chunks before embedding to improve retrieval accuracy
+    Adds context to chunks before embedding to improve retrieval accuracy.
+
+    Now uses chunk-level IDs for industry-standard relevance labeling.
     """
-    
-    def __init__(self,  
-                 chunk_size: int = 500, 
+
+    def __init__(self,
+                 chunk_size: int = 500,
                  chunk_overlap: int = 80,
-                 contextualizer_model: str = "gpt-4o-mini",
+                 contextualizer_model: str = "gpt-5-nano",
                  embedding_model: str = "text-embedding-3-small",
                  max_workers: int = 5):
         """
         Initialize the enhanced preprocessor with contextual retrieval support
-        
+
         Args:
-            openai_api_key: OpenAI API key for embedding generation and contextualization
             chunk_size: Size of each text chunk in characters
             chunk_overlap: Number of overlapping characters between chunks
             contextualizer_model: OpenAI model for generating chunk context
@@ -55,7 +70,10 @@ class DocumentPreprocessor:
         self.bm25_index = None
         self.faiss_index = None
         self.representative_queries = []
-        
+
+        # Chunk ID index for O(1) lookup
+        self.chunk_id_to_index: Dict[str, int] = {}
+
         # Contextualizer prompt based on Anthropic's research
         self.contextualizer_prompt = """
         <document>
@@ -79,6 +97,8 @@ class DocumentPreprocessor:
             List of text chunks
         """
         if len(text) <= self.chunk_size:
+            text = re.sub(r'(\d)', r' \1 ', text)
+            text = re.sub(r'\s+', ' ', text).strip()
             return [text]
             
         chunks = []
@@ -103,7 +123,9 @@ class DocumentPreprocessor:
                 end = best_break
             
             chunk = text[start:end].strip()
-            if chunk:  # Only add non-empty chunks
+            if chunk:
+                chunk = re.sub(r'(\d)', r' \1 ', chunk)
+                chunk = re.sub(r'\s+', ' ', chunk).strip()
                 chunks.append(chunk)
             
             if end >= len(text):
@@ -358,8 +380,11 @@ class DocumentPreprocessor:
                     
             
             representatives.append({
+                "query_id": evaluation_queries[rep_idx].get('query_id'),  # ✅ CRITICAL: Preserve query_id
                 "query": query_texts[rep_idx],
                 "ground_truth": evaluation_queries[rep_idx].get('ground_truth'),
+                "reference_doc_ids": evaluation_queries[rep_idx].get('reference_doc_ids'),  # ✅ Preserve references
+                "reference_evidence_texts": evaluation_queries[rep_idx].get('reference_evidence_texts'),  # ✅ Preserve evidence
                 "cluster_size": len(cluster_indices),
                 "cluster_id": i
             })
@@ -368,10 +393,15 @@ class DocumentPreprocessor:
     
     def process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
         """
-        Process documents with enhanced contextual retrieval pipeline
-        
+        Process documents with enhanced contextual retrieval pipeline.
+
+        Now generates chunk-level IDs for industry-standard relevance labeling.
+        Each chunk gets a unique ID: {doc_id}_chunk_{chunk_index:02d}
+
         Args:
             documents: List of documents with 'text' field
+                       Can be either full documents (will be chunked) or pre-chunked
+                       (if 'chunk_id' field exists, uses that directly)
         """
         print(f"Processing {len(documents)} documents with contextual retrieval...")
         self.use_contextual_retrieval = use_context
@@ -380,47 +410,86 @@ class DocumentPreprocessor:
         all_chunks = []
         all_contextualized_chunks = []
         chunk_metadata = []
-        
+        self.chunk_id_to_index = {}  # Reset index
+
         for doc_idx, doc in enumerate(documents):
-            text = doc.get('text', '')
-            doc_id = doc.get('doc_id', '')
-            
-            print(f"Processing document {doc_idx + 1}/{len(documents)}...")
-            
-            # Create chunks
-            chunks = self.chunk_text(text)
-            contextualized_chunks = chunks
-            
-            # Generate contextual information if enabled
-            if use_context and chunks:
-                contextualized_chunks = self.contextualize_chunks_parallel(chunks, text)
-            
-            # Store both original and contextualized chunks
-            for chunk_idx, (chunk, contextualized_chunk) in enumerate(zip(chunks, contextualized_chunks)):
-                all_chunks.append(chunk)
-                all_contextualized_chunks.append(contextualized_chunk)
-                
+            text = doc.get('text', None)
+            doc_id = doc.get('doc_id', f"doc_{doc_idx}")
+
+            if text is None:
+                continue
+
+            # Check if this is a pre-chunked document (from preprocess_crag.py)
+            if 'chunk_id' in doc:
+                # Pre-chunked: use existing chunk_id directly
+                chunk_id = doc['chunk_id']
+                chunk_text = text
+
+                global_chunk_idx = len(all_chunks)
+                all_chunks.append(chunk_text)
+                all_contextualized_chunks.append(chunk_text)  # Will be contextualized below if needed
+
+                # Store chunk_id -> index mapping for O(1) lookup
+                self.chunk_id_to_index[chunk_id] = global_chunk_idx
+
                 chunk_metadata.append({
-                    'doc_id': doc_id,
-                    'chunk_id': chunk_idx,
+                    'chunk_id': chunk_id,
+                    'doc_id': doc_id,  # For backwards compatibility
+                    'chunk_index': doc.get('chunk_index', 0),
+                    'parent_doc_id': doc.get('parent_doc_id', doc_id),
                     'original_doc': doc,
-                    'original_chunk': chunk,
-                    'contextualized_chunk': contextualized_chunk if use_context else None,
-                    'has_context': use_context
+                    'original_chunk': chunk_text,
+                    'contextualized_chunk': None,
+                    'has_context': False
                 })
-        
+            else:
+                # Full document: chunk it and generate chunk IDs
+                print(f"Processing document {doc_idx + 1}/{len(documents)}...")
+
+                chunks = self.chunk_text(text)
+                contextualized_chunks = chunks
+
+                # Generate contextual information if enabled
+                if use_context and chunks:
+                    contextualized_chunks = self.contextualize_chunks_parallel(chunks, text)
+
+                # Store both original and contextualized chunks with chunk-level IDs
+                for chunk_idx, (chunk, contextualized_chunk) in enumerate(zip(chunks, contextualized_chunks)):
+                    # Generate unique chunk ID
+                    chunk_id = generate_chunk_id(doc_id, chunk_idx)
+                    global_chunk_idx = len(all_chunks)
+
+                    all_chunks.append(chunk)
+                    all_contextualized_chunks.append(contextualized_chunk)
+
+                    # Store chunk_id -> index mapping for O(1) lookup
+                    self.chunk_id_to_index[chunk_id] = global_chunk_idx
+
+                    chunk_metadata.append({
+                        'chunk_id': chunk_id,
+                        'doc_id': doc_id,  # Parent doc ID for backwards compatibility
+                        'chunk_index': chunk_idx,
+                        'parent_doc_id': doc_id,
+                        'original_doc': doc,
+                        'original_chunk': chunk,
+                        'contextualized_chunk': contextualized_chunk if use_context else None,
+                        'has_context': use_context
+                    })
+
         # Store chunks and metadata
         self.chunks = all_chunks
         self.contextualized_chunks = all_contextualized_chunks
         self.chunk_metadata = chunk_metadata
-        
+
+        print(f"Created {len(self.chunk_id_to_index)} chunk IDs for O(1) relevance lookup")
+
         # Conditionally generate embeddings based on retrieval methods
         embedding_input = all_contextualized_chunks if use_context else all_chunks
         bm25_input = all_chunks
 
         print(f"Generating embeddings for {len(embedding_input)} {'contextualized ' if use_context else ''}chunks...")
         self.embeddings = self.generate_embeddings(embedding_input)
-        
+
         print("Creating BM25 index...")
         self.bm25_index = self.create_bm25_index(bm25_input)
 
@@ -428,96 +497,175 @@ class DocumentPreprocessor:
         self.faiss_index = self.create_faiss_index(self.embeddings)
 
     
+    def load_relevance_labels(
+        self,
+        labels_path,
+    ) -> Dict[int, List[int]]:
+        """
+        Load document-level relevance labels and convert to chunk-level indices.
+
+        The labels file contains document-level IDs (from preprocess_crag.py).
+        This method converts them to chunk indices using the chunk metadata.
+
+        Chunk IDs are generated as: {doc_id}_chunk_{chunk_index:02d}
+        All chunks from a relevant document are considered relevant.
+
+        Args:
+            labels_path: Path to relevance_labels.json (query_id -> [doc_ids])
+
+        Returns:
+            Dict mapping query_id to list of relevant chunk indices
+        """
+        import json
+
+        print(f"Loading relevance labels from {labels_path}...")
+
+        with open(labels_path, 'r') as f:
+            doc_level_labels = json.load(f)
+
+        # Convert string keys to int (JSON keys are always strings)
+        doc_level_labels = {int(k): v for k, v in doc_level_labels.items()}
+
+        # Build doc_id -> chunk_indices mapping
+        doc_id_to_chunks = self._build_doc_id_index()
+
+        # Convert doc_ids to chunk indices
+        chunk_level_labels = {}
+        queries_with_no_chunks = []
+
+        for query_id, doc_ids in doc_level_labels.items():
+            chunk_indices = set()
+            for doc_id in doc_ids:
+                # Get all chunks from this document
+                chunks = doc_id_to_chunks.get(doc_id, [])
+                chunk_indices.update(chunks)
+
+            chunk_level_labels[query_id] = list(chunk_indices)
+
+            if not chunk_indices:
+                queries_with_no_chunks.append(query_id)
+
+        # Print statistics
+        total_relevant = sum(len(v) for v in chunk_level_labels.values())
+        avg_relevant = total_relevant / len(chunk_level_labels) if chunk_level_labels else 0
+
+        print(f"Converted document-level to chunk-level relevance:")
+        print(f"  - {len(chunk_level_labels)} queries")
+        print(f"  - {total_relevant} total relevant chunks")
+        print(f"  - {avg_relevant:.1f} avg relevant chunks per query")
+
+        if queries_with_no_chunks:
+            print(f"  - {len(queries_with_no_chunks)} queries have no chunks (docs may not be indexed)")
+
+        return chunk_level_labels
+
+    def _build_chunk_id_index(self) -> Dict[str, int]:
+        """Build chunk_id -> chunk_index mapping for O(1) lookup."""
+        if self.chunk_id_to_index:
+            return self.chunk_id_to_index
+
+        chunk_id_to_index: Dict[str, int] = {}
+        for chunk_idx, meta in enumerate(self.chunk_metadata):
+            chunk_id = meta.get('chunk_id')
+            if chunk_id:
+                chunk_id_to_index[chunk_id] = chunk_idx
+        self.chunk_id_to_index = chunk_id_to_index
+        return chunk_id_to_index
+
+    def _build_doc_id_index(self) -> Dict[str, List[int]]:
+        """Build parent_doc_id -> chunk_indices mapping (for backwards compatibility)."""
+        doc_id_to_chunks: Dict[str, List[int]] = {}
+        for chunk_idx, meta in enumerate(self.chunk_metadata):
+            parent_doc_id = meta.get('parent_doc_id') or meta.get('doc_id')
+            if parent_doc_id:
+                if parent_doc_id not in doc_id_to_chunks:
+                    doc_id_to_chunks[parent_doc_id] = []
+                doc_id_to_chunks[parent_doc_id].append(chunk_idx)
+        return doc_id_to_chunks
+
     def create_relevance_labels(
         self,
         evaluation_queries: List[Dict[str, Any]],
-        overlap_threshold: float = 0.5
     ) -> Dict[int, List[int]]:
-        print(f"Creating precise relevance labels for {len(evaluation_queries)} queries...")
-        
+        """
+        Create relevance labels from evaluation queries using chunk-level IDs.
+
+        This method supports both:
+        1. New format: reference_chunk_ids (chunk-level, preferred)
+        2. Legacy format: reference_doc_ids (doc-level, for backwards compatibility)
+
+        Args:
+            evaluation_queries: List of query dicts with query_id and
+                               reference_chunk_ids or reference_doc_ids
+
+        Returns:
+            Dict mapping query_id to list of relevant chunk indices
+        """
+        print(f"Creating relevance labels for {len(evaluation_queries)} queries...")
+
+        # Ensure chunk_id index is built
+        if not self.chunk_id_to_index:
+            self._build_chunk_id_index()
+
         relevance_labels = {}
-        
+        queries_with_no_relevant = []
+        using_chunk_ids = False
+        using_doc_ids = False
+
         for query in tqdm(evaluation_queries, desc="Creating labels"):
             query_id = query['query_id']
-            reference_evidence_texts = query.get('reference_evidence_texts', [])
-            
-            relevant_chunk_indices = []
-            
-            # For each chunk, check if it overlaps with any evidence snippet
-            for chunk_idx, meta in enumerate(self.chunk_metadata):
-                chunk_text = meta['original_chunk']
-                chunk_doc_id = meta['doc_id']
-                
-                for evidence_info in reference_evidence_texts:
+            relevant_chunk_indices = set()
 
-                    if chunk_doc_id != evidence_info['doc_id']:
-                        continue
-                    
-                    evidence_text = evidence_info['evidence_text']
-                    overlap_ratio = self._calculate_text_overlap(chunk_text, evidence_text)
-                    
-                    if overlap_ratio >= overlap_threshold:
-                        relevant_chunk_indices.append(chunk_idx)
-                        break  # Don't double-count same chunk
-            
-            relevance_labels[query_id] = relevant_chunk_indices
-        
+            reference_chunk_ids = query.get('reference_chunk_ids', [])
+            if reference_chunk_ids:
+                using_chunk_ids = True
+                for chunk_id in reference_chunk_ids:
+                    if chunk_id in self.chunk_id_to_index:
+                        relevant_chunk_indices.add(self.chunk_id_to_index[chunk_id])
+
+            if not relevant_chunk_indices:
+                reference_doc_ids = query.get('reference_doc_ids', [])
+                if reference_doc_ids:
+                    using_doc_ids = True
+                    doc_id_to_chunks = self._build_doc_id_index()
+                    for doc_id in reference_doc_ids:
+                        # Check if doc_id is actually a chunk_id
+                        if doc_id in self.chunk_id_to_index:
+                            relevant_chunk_indices.add(self.chunk_id_to_index[doc_id])
+                        else:
+                            # Legacy: get all chunks from parent doc
+                            chunk_indices = doc_id_to_chunks.get(doc_id, [])
+                            relevant_chunk_indices.update(chunk_indices)
+
+            relevance_labels[query_id] = list(relevant_chunk_indices)
+
+            if not relevant_chunk_indices:
+                queries_with_no_relevant.append(query_id)
+
         # Print statistics
         total_relevant = sum(len(v) for v in relevance_labels.values())
         avg_relevant = total_relevant / len(relevance_labels) if relevance_labels else 0
-        
-        print(f"Created relevance labels:")
+        queries_with_relevant = sum(1 for v in relevance_labels.values() if v)
+
+        print(f"\nRelevance labels created:")
+        format_str = 'chunk-level IDs' if using_chunk_ids else ('doc-level IDs (legacy)' if using_doc_ids else 'no IDs found')
+        print(f"  - Format: {format_str}")
+        print(f"  - Queries with relevant chunks: {queries_with_relevant}/{len(relevance_labels)}")
         print(f"  - Total relevant chunks: {total_relevant}")
         print(f"  - Average relevant chunks per query: {avg_relevant:.1f}")
-        print(f"  - Total chunks in corpus: {len(self.chunk_metadata)}")
-        print(f"  - Relevance ratio: {total_relevant / len(self.chunk_metadata) / len(relevance_labels):.2%}")
-        
-        return relevance_labels
 
-    
-    def _calculate_text_overlap(self, chunk_text: str, evidence_text: str) -> float:
-        """Calculate overlap with fuzzy matching support"""
-        
-        chunk_lower = chunk_text.lower()
-        evidence_lower = evidence_text.lower()
-        
-        # Exact containment (best case)
-        if evidence_lower in chunk_lower:
-            return 1.0
-        
-        # Fuzzy subsequence matching (handles small variations)
-        # Split evidence into sentences/segments
-        evidence_segments = [s.strip() for s in evidence_lower.split('.') if s.strip()]
-        
-        max_overlap = 0.0
-        for segment in evidence_segments:
-            if not segment:
-                continue
-            
-            # Find best fuzzy match in chunk
-            matcher = SequenceMatcher(None, segment, chunk_lower)
-            match = matcher.find_longest_match(0, len(segment), 0, len(chunk_lower))
-            
-            if match.size > 0:
-                segment_overlap = match.size / len(segment)
-                max_overlap = max(max_overlap, segment_overlap)
-        
-        # Fallback to token overlap
-        if max_overlap < 0.3:
-            chunk_tokens = set(self.tokenize_text(chunk_text))
-            evidence_tokens = set(self.tokenize_text(evidence_text))
-            
-            if evidence_tokens:
-                overlap_tokens = chunk_tokens & evidence_tokens
-                max_overlap = max(max_overlap, len(overlap_tokens) / len(evidence_tokens))
-        
-        return max_overlap
+        if queries_with_no_relevant:
+            print(f"  - {len(queries_with_no_relevant)} queries have NO relevant chunks")
+            if len(queries_with_no_relevant) <= 5:
+                print(f"    Query IDs: {queries_with_no_relevant}")
+
+        return relevance_labels
 
     
     def save_index(self, index_path: str, metadata_path: str) -> None:
         """
-        Save the FAISS index and enhanced metadata to disk
-        
+        Save the FAISS index and enhanced metadata to disk.
+
         Args:
             index_path: Path to save FAISS index
             metadata_path: Path to save chunk metadata
@@ -525,28 +673,30 @@ class DocumentPreprocessor:
         # Save FAISS index only if it exists
         if self.faiss_index is not None:
             faiss.write_index(self.faiss_index, index_path)
-            print(f"✅ FAISS index saved to {index_path}")
+            print(f"FAISS index saved to {index_path}")
         else:
-            print("📊 No FAISS index to save (BM25-only mode)")
-            
-        # Always save metadata
+            print("No FAISS index to save (BM25-only mode)")
+
+        # Always save metadata including chunk_id_to_index for O(1) lookup
         with open(metadata_path, 'wb') as f:
             pickle.dump({
                 'chunks': self.chunks,
                 'contextualized_chunks': self.contextualized_chunks,
                 'chunk_metadata': self.chunk_metadata,
+                'chunk_id_to_index': self.chunk_id_to_index,
                 'embeddings': self.embeddings,
                 'use_contextual_retrieval': self.use_contextual_retrieval,
                 'contextualizer_model': self.contextualizer_model,
                 'embedding_model': self.embedding_model
             }, f)
-        
-        print(f"✅ Metadata saved to {metadata_path}")
+
+        print(f"Metadata saved to {metadata_path}")
+        print(f"  - {len(self.chunk_id_to_index)} chunk IDs indexed")
     
     def load_index(self, index_path: str, metadata_path: str, use_context: bool = True) -> None:
         """
-        Load the FAISS index and enhanced metadata from disk
-        
+        Load the FAISS index and enhanced metadata from disk.
+
         Args:
             index_path: Path to FAISS index file
             metadata_path: Path to metadata file
@@ -562,9 +712,13 @@ class DocumentPreprocessor:
             self.contextualizer_model = data.get('contextualizer_model', 'gpt-4o-mini')
             self.embedding_model = data.get('embedding_model', 'text-embedding-3-small')
 
+            # Load chunk_id_to_index if available, otherwise rebuild it
+            self.chunk_id_to_index = data.get('chunk_id_to_index', {})
+            if not self.chunk_id_to_index:
+                print("Rebuilding chunk_id_to_index from metadata...")
+                self._build_chunk_id_index()
+
         if self.chunks:
-            # bm25_source = self.contextualized_chunks if (self.use_contextual_retrieval and self.contextualized_chunks) else self.chunks
-            # self.bm25_index = self.create_bm25_index(bm25_source)
             self.bm25_index = self.create_bm25_index(self.chunks)
         else:
             self.bm25_index = None
@@ -580,14 +734,15 @@ class DocumentPreprocessor:
         if self.faiss_index is None and self.embeddings:
             try:
                 self.faiss_index = self.create_faiss_index(self.embeddings)
-                print("⚠️ Recreated FAISS index from stored embeddings.")
+                print("Recreated FAISS index from stored embeddings.")
             except Exception as e:
                 print(f"Error recreating FAISS index from embeddings: {e}")
                 self.faiss_index = None
 
-        # Print contextual retrieval info
+        # Print loading summary
         if hasattr(self, 'chunk_metadata') and self.chunk_metadata:
             contextual_chunks = sum(1 for meta in self.chunk_metadata if meta.get('has_context', False))
             total_chunks = len(self.chunk_metadata)
+            print(f"Loaded {total_chunks} chunks with {len(self.chunk_id_to_index)} chunk IDs indexed")
             if self.use_contextual_retrieval:
-                print(f"📊 Contextual Retrieval: {contextual_chunks}/{total_chunks} chunks have context")
+                print(f"  Contextual Retrieval: {contextual_chunks}/{total_chunks} chunks have context")

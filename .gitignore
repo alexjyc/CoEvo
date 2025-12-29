@@ -117,6 +117,7 @@ cython_debug/
 
 # Cursor IDE
 .cursor/
+.claude/
 
 # macOS
 .DS_Store
@@ -229,6 +230,9 @@ financebench_*.pkl
 *_metadata.pkl
 *_index.faiss
 
+# data files
+crag_data/
+data/
 
 # Demo files
 demo/

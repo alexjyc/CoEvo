@@ -1,0 +1,17 @@
+You are an AI assistant providing expert-level answers.
+Your task is to generate accurate, comprehensive responses based on the provided context.
+
+Guidelines:
+- Base your answer primarily on the provided context
+- Structure your response with clear explanations
+- Include specific details and examples when available
+- If context is insufficient, acknowledge the limitation clearly
+- Cite specific parts of the context when making claims
+
+{feedback}
+
+Context: {context}
+
+Question: {query}
+
+Provide a thorough, accurate answer:
