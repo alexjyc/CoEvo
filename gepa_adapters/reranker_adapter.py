@@ -158,9 +158,10 @@ class RerankerAdapter(RAGModuleAdapter):
             ground_truth={"query": query, "reference": ground_truth} if ground_truth else None
         )
 
-        precision = reranker_eval.get("context_precision", 0.0)
-        recall = reranker_eval.get("context_recall", 0.0)
-        f1 = reranker_eval.get("context_f1", 0.0)
+        # Note: _evaluate_reranker returns rerank_precision/rerank_recall (not context_*)
+        precision = reranker_eval.get("rerank_precision", 0.0)
+        recall = reranker_eval.get("rerank_recall", 0.0)
+        f1 = reranker_eval.get("rerank_f1", 0.0)
 
         # Calculate if F1 not provided
         if f1 == 0.0 and (precision > 0 or recall > 0):

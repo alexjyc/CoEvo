@@ -233,6 +233,7 @@ financebench_*.pkl
 # data files
 crag_data/
 data/
+experiments/
 
 # Demo files
 demo/

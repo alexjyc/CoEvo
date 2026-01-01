@@ -10,20 +10,24 @@ Module 3 (Generator): faithfulness, answer_correctness
 """
 
 import os
+import asyncio
 from typing import List, Dict, Any, Optional
 
-from openai import AsyncOpenAI
+from langchain_openai import ChatOpenAI
+from ragas.llms import LangchainLLMWrapper
 
-from ragas.llms import llm_factory
-from ragas.embeddings import embedding_factory
 from ragas import SingleTurnSample
-from ragas.metrics.collections import (
-    ContextPrecision,
-    ContextRecall,
-    AnswerCorrectness,
+from ragas.metrics import (
+    LLMContextPrecisionWithReference,
+    LLMContextRecall,
     Faithfulness,
+    AnswerCorrectness,  # More comprehensive - factual accuracy + semantic similarity
+    AnswerSimilarity,   # Required for AnswerCorrectness
+    IDBasedContextPrecision,
+    IDBasedContextRecall,
 )
-from ragas.metrics import IDBasedContextPrecision, IDBasedContextRecall
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_openai import OpenAIEmbeddings
 
 from modules.base import (
     ModuleType,
@@ -52,20 +56,25 @@ class RAGASEvaluator(ModuleEvaluator):
 
     def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
-        """Initialize RAGAS metrics with evaluator LLM"""
-        # Create evaluator LLM and embeddings
-        self.evaluator_llm = llm_factory(
+        """Initialize RAGAS metrics with evaluator LLM using LangchainLLMWrapper"""
+        # Use LangchainLLMWrapper as recommended by RAGAS documentation
+        chat_llm = ChatOpenAI(
             model=self.model,
-            client=self.client
+            temperature=0,
+            request_timeout=60,
+            max_retries=3,
         )
-        self.evaluator_embeddings = embedding_factory(
-            model="text-embedding-3-small",
-            client=self.client
-        )
+        self.evaluator_llm = LangchainLLMWrapper(chat_llm)
+
+        # Initialize embeddings for AnswerSimilarity (used by AnswerCorrectness)
+        langchain_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        self.evaluator_embeddings = LangchainEmbeddingsWrapper(langchain_embeddings)
+
+        # Initialize AnswerSimilarity with embeddings (required for AnswerCorrectness)
+        answer_similarity = AnswerSimilarity(embeddings=self.evaluator_embeddings)
 
         # Initialize metrics
         self.metrics = {
@@ -74,14 +83,65 @@ class RAGASEvaluator(ModuleEvaluator):
             'id_context_recall': IDBasedContextRecall(),
 
             # LLM-based metrics (when only reference answer available)
-            'context_precision': ContextPrecision(llm=self.evaluator_llm),
-            'context_recall': ContextRecall(llm=self.evaluator_llm),
+            'context_precision': LLMContextPrecisionWithReference(llm=self.evaluator_llm),
+            'context_recall': LLMContextRecall(llm=self.evaluator_llm),
             'faithfulness': Faithfulness(llm=self.evaluator_llm),
+            # AnswerCorrectness = factual accuracy + semantic similarity (more comprehensive)
             'answer_correctness': AnswerCorrectness(
                 llm=self.evaluator_llm,
-                embeddings=self.evaluator_embeddings
+                answer_similarity=answer_similarity,
             ),
         }
+
+    async def _call_metric(
+        self,
+        metric_name: str,
+        max_retries: int = 5,
+        **kwargs
+    ) -> float:
+        """
+        Call a RAGAS metric with automatic retry for connection errors.
+        
+        Uses SingleTurnSample as recommended by RAGAS documentation.
+        
+        Args:
+            metric_name: Name of the metric in self.metrics
+            max_retries: Maximum retry attempts
+            **kwargs: Arguments to build SingleTurnSample
+            
+        Returns:
+            Metric score as float, or 0.0 on failure
+        """
+        metric = self.metrics[metric_name]
+        
+        # Build SingleTurnSample from kwargs
+        sample = SingleTurnSample(**kwargs)
+        
+        last_exception = None
+        for attempt in range(max_retries + 1):
+            try:
+                result = await metric.single_turn_ascore(sample)
+                return float(result) if result is not None else 0.0
+            except Exception as e:
+                last_exception = e
+                error_str = str(e).lower()
+                
+                # Check if retryable error
+                is_retryable = any(err in error_str for err in [
+                    'connection', 'timeout', 'rate limit', 'server error',
+                    '503', '502', '504', '429', 'reset by peer', 'broken pipe'
+                ])
+                
+                if attempt < max_retries and is_retryable:
+                    delay = min(2.0 * (2 ** attempt), 60.0)
+                    print(f"  [RETRY] {metric_name} attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    break
+        
+        # Log final failure
+        print(f"[RAGAS] {metric_name} failed after {max_retries} retries: {str(last_exception)[:100]}")
+        return 0.0
 
     async def evaluate(
         self,
@@ -209,19 +269,23 @@ class RAGASEvaluator(ModuleEvaluator):
             
             if doc_texts:
                 try:
-                    precision = await self.metrics['context_precision'].ascore(
-                        user_input=query,
+                    # Ensure all doc_texts are strings
+                    doc_texts = [str(d) for d in doc_texts if d]
+                    if not doc_texts:
+                        doc_texts = ["No context available."]
+                    
+                    scores['context_precision'] = await self._call_metric(
+                        'context_precision',
+                        user_input=str(query),
                         retrieved_contexts=doc_texts,
-                        reference=reference
+                        reference=str(reference)
                     )
-                    recall = await self.metrics['context_recall'].ascore(
-                        user_input=query,
+                    scores['context_recall'] = await self._call_metric(
+                        'context_recall',
+                        user_input=str(query),
                         retrieved_contexts=doc_texts,
-                        reference=reference
+                        reference=str(reference)
                     )
-
-                    scores['context_precision'] = float(precision) if precision else 0.0
-                    scores['context_recall'] = float(recall) if recall else 0.0
 
                     # Calculate F1
                     if scores['context_precision'] + scores['context_recall'] > 0:
@@ -267,23 +331,37 @@ class RAGASEvaluator(ModuleEvaluator):
 
         if not query or not reference:
             return scores
+        
+        # Ensure reference is a string (not float or other type)
+        reference = str(reference) if reference else ""
+        query = str(query) if query else ""
+        
+        # Get ranked documents and ensure it's a list of strings
+        ranked_docs = getattr(output_data, 'ranked_documents', [])
+        if not ranked_docs:
+            return {'context_precision': 0.0, 'context_recall': 0.0, 'context_f1': 0.0}
+        
+        # Convert all docs to strings and filter empty
+        ranked_docs = [str(doc) for doc in ranked_docs if doc]
+        if not ranked_docs:
+            return {'context_precision': 0.0, 'context_recall': 0.0, 'context_f1': 0.0}
 
         try:
-            # Evaluate context precision after reranking
-            post_precision = await self.metrics['context_precision'].ascore(
-                user_input=query,
-                retrieved_contexts=output_data.ranked_documents,
-                reference=reference
+            # Evaluate context precision after reranking (with retry)
+            scores['rerank_precision'] = await self._call_metric(
+                'context_precision',
+                user_input=str(query),
+                retrieved_contexts=[str(d) for d in ranked_docs],
+                reference=str(reference)
             )
-            scores['rerank_precision'] = float(post_precision) if post_precision else 0.0
 
-            # Evaluate context recall after reranking
-            post_recall = await self.metrics['context_recall'].ascore(
-                user_input=query,
-                retrieved_contexts=output_data.ranked_documents,
-                reference=reference
+            # Evaluate context recall after reranking (with retry)
+            scores['rerank_recall'] = await self._call_metric(
+                'context_recall',
+                user_input=str(query),
+                retrieved_contexts=[str(d) for d in ranked_docs],
+                reference=str(reference)
             )
-            scores['rerank_recall'] = float(post_recall) if post_recall else 0.0
 
             # Calculate F1
             if scores['rerank_precision'] + scores['rerank_recall'] > 0:
@@ -300,26 +378,24 @@ class RAGASEvaluator(ModuleEvaluator):
             # If pre-rerank documents provided but not scores, compute them
             pre_rerank_docs = ground_truth.get('pre_rerank_documents')
             if pre_rerank_docs and pre_precision is None:
-                try:
-                    pre_precision = await self.metrics['context_precision'].ascore(
-                        user_input=query,
-                        retrieved_contexts=pre_rerank_docs,
-                        reference=reference
+                pre_docs = [str(d) for d in pre_rerank_docs if d]
+                if pre_docs:
+                    pre_precision = await self._call_metric(
+                        'context_precision',
+                        user_input=str(query),
+                        retrieved_contexts=pre_docs,
+                        reference=str(reference)
                     )
-                    pre_precision = float(pre_precision) if pre_precision else 0.0
-                except Exception:
-                    pre_precision = None
 
             if pre_rerank_docs and pre_recall is None:
-                try:
-                    pre_recall = await self.metrics['context_recall'].ascore(
-                        user_input=query,
-                        retrieved_contexts=pre_rerank_docs,
-                        reference=reference
+                pre_docs = [str(d) for d in pre_rerank_docs if d]
+                if pre_docs:
+                    pre_recall = await self._call_metric(
+                        'context_recall',
+                        user_input=str(query),
+                        retrieved_contexts=pre_docs,
+                        reference=str(reference)
                     )
-                    pre_recall = float(pre_recall) if pre_recall else 0.0
-                except Exception:
-                    pre_recall = None
 
             # Calculate improvement metrics
             if pre_precision is not None:
@@ -368,7 +444,7 @@ class RAGASEvaluator(ModuleEvaluator):
         Args:
             ground_truth: Dict with 'query', 'contexts', 'reference' (ground truth answer)
         """
-        scores = {}
+        scores = {'faithfulness': 0.0, 'answer_correctness': 0.0, 'generation_quality': 0.0}
 
         if not ground_truth:
             return scores
@@ -376,31 +452,38 @@ class RAGASEvaluator(ModuleEvaluator):
         query = ground_truth.get('query', '')
         contexts = ground_truth.get('contexts', [])
         reference = ground_truth.get('reference', '')
+        
+        # Ensure all inputs are proper types
+        query = str(query) if query else ""
+        reference = str(reference) if reference else ""
+        
+        # Ensure contexts is a list of non-empty strings
+        if not contexts:
+            contexts = []
+        contexts = [str(c) for c in contexts if c]
+        if not contexts:
+            contexts = ["No context provided."]
+        
+        # Get the answer from output_data
+        answer = getattr(output_data, 'answer', '')
+        answer = str(answer) if answer else "No answer generated."
 
-        # Faithfulness: Is the answer grounded in contexts?
-        try:
-            faithfulness = await self.metrics['faithfulness'].ascore(
-                user_input=query,
-                response=output_data.answer,
-                retrieved_contexts=contexts
-            )
-            scores['faithfulness'] = float(faithfulness) if faithfulness else 0.0
-        except Exception as e:
-            print(f"Error evaluating faithfulness: {e}")
-            scores['faithfulness'] = 0.0
+        # Faithfulness: Is the answer grounded in contexts? (with retry)
+        scores['faithfulness'] = await self._call_metric(
+            'faithfulness',
+            user_input=str(query),
+            response=str(answer),
+            retrieved_contexts=[str(c) for c in contexts]
+        )
 
-        # Answer Correctness: Does the answer match ground truth?
+        # Answer Correctness: Does the answer match ground truth? (with retry)
         if reference:
-            try:
-                correctness = await self.metrics['answer_correctness'].ascore(
-                    user_input=query,
-                    response=output_data.answer,
-                    reference=reference
-                )
-                scores['answer_correctness'] = float(correctness) if correctness else 0.0
-            except Exception as e:
-                print(f"Error evaluating answer_correctness: {e}")
-                scores['answer_correctness'] = 0.0
+            scores['answer_correctness'] = await self._call_metric(
+                'answer_correctness',
+                user_input=str(query),
+                response=str(answer),
+                reference=str(reference)
+            )
 
         # Calculate generation quality
         scores['generation_quality'] = (
@@ -441,31 +524,27 @@ class RAGASEvaluator(ModuleEvaluator):
         
         reference = str(reference)
         
-        try:
-            precision = await self.metrics['context_precision'].ascore(
-                user_input=query,
-                retrieved_contexts=documents,
-                reference=reference
-            )
-            scores['context_precision'] = float(precision) if precision else 0.0
-            
-            recall = await self.metrics['context_recall'].ascore(
-                user_input=query,
-                retrieved_contexts=documents,
-                reference=reference
-            )
-            scores['context_recall'] = float(recall) if recall else 0.0
-            
-            # Calculate F1
-            if scores['context_precision'] + scores['context_recall'] > 0:
-                scores['context_f1'] = 2 * (
-                    scores['context_precision'] * scores['context_recall']
-                ) / (scores['context_precision'] + scores['context_recall'])
-            else:
-                scores['context_f1'] = 0.0
-                
-        except Exception as e:
-            print(f"Error computing retrieval scores: {e}")
+        scores['context_precision'] = await self._call_metric(
+            'context_precision',
+            user_input=str(query),
+            retrieved_contexts=documents,
+            reference=reference
+        )
+        
+        scores['context_recall'] = await self._call_metric(
+            'context_recall',
+            user_input=str(query),
+            retrieved_contexts=documents,
+            reference=reference
+        )
+        
+        # Calculate F1
+        if scores['context_precision'] + scores['context_recall'] > 0:
+            scores['context_f1'] = 2 * (
+                scores['context_precision'] * scores['context_recall']
+            ) / (scores['context_precision'] + scores['context_recall'])
+        else:
+            scores['context_f1'] = 0.0
             
         return scores
 
@@ -494,16 +573,32 @@ class RAGASEvaluator(ModuleEvaluator):
         scores = {}
         
         # Validate inputs - ensure contexts is a non-empty list of strings
-        if not contexts:
+        if not contexts or not isinstance(contexts, (list, tuple)):
             contexts = ["No context retrieved."]
-        contexts = [str(c) for c in contexts if c]  # Ensure all items are strings
-        if not contexts:
-            contexts = ["No context retrieved."]
+        else:
+            # Convert all items to strings, filtering empty/None values
+            validated_contexts = []
+            for c in contexts:
+                if c is not None:
+                    c_str = str(c) if not isinstance(c, str) else c
+                    if c_str.strip():  # Only add non-empty strings
+                        validated_contexts.append(c_str)
+            contexts = validated_contexts if validated_contexts else ["No context retrieved."]
+            
+        # Ensure query is a string
+        if not isinstance(query, str):
+            query = str(query) if query else "No query provided."
             
         # Ensure answer and ground_truth are strings
-        answer = str(answer) if answer else "No answer generated."
-        if ground_truth is not None:
+        if not isinstance(answer, str):
+            answer = str(answer) if answer else "No answer generated."
+        if not answer.strip():
+            answer = "No answer generated."
+            
+        if ground_truth is not None and not isinstance(ground_truth, str):
             ground_truth = str(ground_truth) if ground_truth else None
+        if ground_truth and not ground_truth.strip():
+            ground_truth = None
 
         # Chunk-level retrieval metrics (PRIMARY - correct level for RAG retrieval)
         if retrieved_chunk_indices and relevant_chunk_indices:
@@ -524,53 +619,40 @@ class RAGASEvaluator(ModuleEvaluator):
 
         # Context quality (LLM-based) - only if we have real contexts and ground truth
         if ground_truth and len(contexts) > 0 and contexts[0] != "No context retrieved.":
-            try:
-                ctx_precision = await self.metrics['context_precision'].ascore(
-                    user_input=query,
-                    retrieved_contexts=contexts,
-                    reference=ground_truth
-                )
-                ctx_recall = await self.metrics['context_recall'].ascore(
-                    user_input=query,
-                    retrieved_contexts=contexts,
-                    reference=ground_truth
-                )
-                scores['context_precision'] = float(ctx_precision) if ctx_precision else 0.0
-                scores['context_recall'] = float(ctx_recall) if ctx_recall else 0.0
-            except Exception as e:
-                print(f"Error in context evaluation: {e}")
-                scores['context_precision'] = 0.0
-                scores['context_recall'] = 0.0
+            scores['context_precision'] = await self._call_metric(
+                'context_precision',
+                user_input=query,
+                retrieved_contexts=contexts,
+                reference=ground_truth,
+            )
+            scores['context_recall'] = await self._call_metric(
+                'context_recall',
+                user_input=query,
+                retrieved_contexts=contexts,
+                reference=ground_truth,
+            )
         else:
             scores['context_precision'] = 0.0
             scores['context_recall'] = 0.0
 
         # Generation metrics - only if we have real contexts
         if len(contexts) > 0 and contexts[0] != "No context retrieved.":
-            try:
-                faithfulness = await self.metrics['faithfulness'].ascore(
-                    user_input=query,
-                    response=answer,
-                    retrieved_contexts=contexts
-                )
-                scores['faithfulness'] = float(faithfulness) if faithfulness else 0.0
-            except Exception as e:
-                print(f"Error evaluating faithfulness: {e}")
-                scores['faithfulness'] = 0.0
+            scores['faithfulness'] = await self._call_metric(
+                'faithfulness',
+                user_input=query,
+                response=answer,
+                retrieved_contexts=contexts,
+            )
         else:
             scores['faithfulness'] = 0.0
 
         if ground_truth:
-            try:
-                correctness = await self.metrics['answer_correctness'].ascore(
-                    user_input=query,
-                    response=answer,
-                    reference=ground_truth
-                )
-                scores['answer_correctness'] = float(correctness) if correctness else 0.0
-            except Exception as e:
-                print(f"Error evaluating answer_correctness: {e}")
-                scores['answer_correctness'] = 0.0
+            scores['answer_correctness'] = await self._call_metric(
+                'answer_correctness',
+                user_input=query,
+                response=answer,
+                reference=ground_truth,
+            )
         else:
             scores['answer_correctness'] = 0.0
 

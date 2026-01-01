@@ -24,9 +24,33 @@ Usage with gepa.optimize():
 """
 
 import asyncio
+import atexit
+import gc
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, TypeVar, TypedDict
+
+# Suppress semaphore leak warnings at shutdown
+def _cleanup_multiprocessing():
+    """Clean up multiprocessing resources to avoid semaphore leak warnings."""
+    try:
+        # Force garbage collection before shutdown
+        gc.collect()
+        # Suppress the resource_tracker warning
+        import multiprocessing.resource_tracker
+        multiprocessing.resource_tracker._resource_tracker._stop = lambda *args, **kwargs: None
+    except Exception:
+        pass
+
+atexit.register(_cleanup_multiprocessing)
+
+# Set multiprocessing start method to 'spawn' to avoid fork-related issues on macOS
+try:
+    import multiprocessing
+    if multiprocessing.get_start_method(allow_none=True) is None:
+        multiprocessing.set_start_method('spawn')
+except RuntimeError:
+    pass  # Already set
 
 # Import GEPA types - use actual library when available
 try:
@@ -303,22 +327,29 @@ class RAGModuleAdapter(_BaseClass):
         # Handle both standalone and nested event loop contexts (e.g., GEPA)
         try:
             loop = asyncio.get_running_loop()
-            # We're in an existing event loop - use nest_asyncio or run in thread
-            import nest_asyncio
-            nest_asyncio.apply()
-            return asyncio.run(self._evaluate_async(batch, candidate, capture_traces))
+            # We're in an existing event loop - use loop.run_until_complete or thread
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+                # Use the existing loop instead of creating a new one
+                future = asyncio.ensure_future(
+                    self._evaluate_async(batch, candidate, capture_traces),
+                    loop=loop
+                )
+                return loop.run_until_complete(future)
+            except ImportError:
+                # nest_asyncio not available - run in separate thread with new loop
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        lambda: asyncio.run(
+                            self._evaluate_async(batch, candidate, capture_traces)
+                        )
+                    )
+                    return future.result()
         except RuntimeError:
             # No running event loop - safe to use asyncio.run()
             return asyncio.run(self._evaluate_async(batch, candidate, capture_traces))
-        except ImportError:
-            # nest_asyncio not available - run in separate thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    self._evaluate_async(batch, candidate, capture_traces)
-                )
-                return future.result()
 
     async def _evaluate_async(
         self,
