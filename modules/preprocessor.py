@@ -216,39 +216,63 @@ class DocumentPreprocessor:
     
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
-        Generate embeddings for a list of texts using OpenAI's embedding model
-        Now supports batch processing for better performance
-        
+        Generate embeddings for a list of texts using OpenAI's embedding model.
+        Supports batch processing for better performance.
+
+        Handles invalid texts (None, empty, whitespace-only) by using zero vectors
+        while maintaining 1:1 correspondence between input and output indices.
+
         Args:
             texts: List of text strings to embed
-            
+
         Returns:
-            List of embedding vectors
+            List of embedding vectors (same length as input texts)
         """
         embeddings = []
         batch_size = 128  # OpenAI supports up to 2048 inputs per request
-        
+        embedding_dim = 1536 if "3-small" in self.embedding_model else 3072
+
         print(f"Generating embeddings for {len(texts)} texts in batches of {batch_size}...")
-        
+
         for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
             batch = texts[i:i + batch_size]
-            
+
+            # Identify valid texts and their positions within this batch
+            valid_texts = []
+            valid_positions = []
+            for pos, text in enumerate(batch):
+                if text and isinstance(text, str) and text.strip():
+                    valid_texts.append(text)
+                    valid_positions.append(pos)
+
+            if not valid_texts:
+                # All items in batch are invalid - add zero vectors for each
+                embeddings.extend([[0.0] * embedding_dim for _ in batch])
+                continue
+
             try:
                 response = self.client.embeddings.create(
-                    input=batch,
+                    input=valid_texts,
                     model=self.embedding_model
                 )
-                
-                batch_embeddings = [data.embedding for data in response.data]
-                embeddings.extend(batch_embeddings)
-                
+
+                # Build position -> embedding mapping
+                response_embeddings = [data.embedding for data in response.data]
+                pos_to_embedding = dict(zip(valid_positions, response_embeddings))
+
+                # Generate embeddings preserving original order
+                # Invalid texts get zero vectors, valid texts get their embeddings
+                for pos in range(len(batch)):
+                    if pos in pos_to_embedding:
+                        embeddings.append(pos_to_embedding[pos])
+                    else:
+                        embeddings.append([0.0] * embedding_dim)
+
             except Exception as e:
                 print(f"Error generating embeddings for batch {i//batch_size}: {e}")
-                # Add zero vectors as placeholders
-                embedding_dim = 1536 if "3-small" in self.embedding_model else 3072
-                for _ in batch:
-                    embeddings.append([0.0] * embedding_dim)
-                
+                # Add zero vectors as placeholders for entire batch
+                embeddings.extend([[0.0] * embedding_dim for _ in batch])
+
         return embeddings
 
     def tokenize_text(self, text: str) -> List[str]:

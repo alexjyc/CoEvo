@@ -42,6 +42,7 @@ import statistics
 import math
 from functools import wraps
 from dotenv import load_dotenv
+from tqdm.asyncio import tqdm_asyncio
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -354,6 +355,7 @@ class ResearchExperimentRunner:
         train_ratio: float = 0.6,
         val_ratio: float = 0.2,
         test_ratio: float = 0.2,
+        max_concurrent: int = 10,
     ):
         self.experiment_name = experiment_name
         self.output_dir = output_dir / experiment_name
@@ -373,6 +375,10 @@ class ResearchExperimentRunner:
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
+
+        # Concurrency control for parallel API calls
+        self.max_concurrent = max_concurrent
+        self._semaphore: Optional[asyncio.Semaphore] = None  # Initialized lazily
 
         # Set random seeds for reproducibility
         random.seed(random_seed)
@@ -566,7 +572,18 @@ class ResearchExperimentRunner:
         print(f"  Chunk labels: {len(self.chunk_labels)} queries")
 
     # -------------------------------------------------------------------------
-    # Context Generation (with retry)
+    # Concurrency Control
+    # -------------------------------------------------------------------------
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        """Lazy initialization of semaphore to avoid event loop issues."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        return self._semaphore
+
+    # -------------------------------------------------------------------------
+    # Context Generation (with retry and parallelism)
     # -------------------------------------------------------------------------
 
     @retry_with_backoff(max_retries=5, base_delay=2.0)
@@ -589,66 +606,84 @@ class ResearchExperimentRunner:
         output = await self.generator.run(GeneratorInput(query=query, context=context))
         return output.answer
 
+    async def _process_single_query_context(
+        self,
+        q: Dict,
+    ) -> Tuple[str, List[str], List[str], Optional[str]]:
+        """Process a single query through planning, retrieval, and reranking.
+
+        Returns:
+            Tuple of (query_id, retrieved_docs, reranked_docs, error_message)
+        """
+        qid = q["query_id"]
+        query_text = q["query"]
+
+        async with self.semaphore:
+            try:
+                planned = await self._run_query_planner_single(query_text)
+                docs, _ = await self._run_retrieval_single(planned, self.retrieval_k)
+                ranked = await self._run_reranker_single(query_text, docs)
+                return (qid, docs, ranked, None)
+            except Exception as e:
+                return (qid, [], [], str(e)[:80])
+
     async def generate_contexts_for_split(
         self,
         queries: List[Dict],
         description: str = "",
     ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-        """Generate contexts for a specific data split."""
-        print(f"\n  Generating contexts ({description}, n={len(queries)})...")
+        """Generate contexts for a specific data split with parallel processing."""
+        print(f"\n  Generating contexts ({description}, n={len(queries)}, concurrency={self.max_concurrent})...")
 
+        # Create tasks for all queries
+        tasks = [self._process_single_query_context(q) for q in queries]
+
+        # Run all tasks concurrently with progress bar
+        results = await tqdm_asyncio.gather(
+            *tasks,
+            desc=f"    Processing queries",
+            total=len(tasks),
+        )
+
+        # Collect results
         retrieved_contexts: Dict[str, List[str]] = {}
         reranked_contexts: Dict[str, List[str]] = {}
+        errors = 0
 
-        for i, q in enumerate(queries):
-            qid = q["query_id"]
-            query_text = q["query"]
+        for qid, retrieved, reranked, error in results:
+            retrieved_contexts[qid] = retrieved
+            reranked_contexts[qid] = reranked
+            if error:
+                errors += 1
+                print(f"    [ERROR] Query {qid}: {error}")
 
-            try:
-                planned = await self._run_query_planner_single(query_text)
-                docs, _ = await self._run_retrieval_single(planned, self.retrieval_k)
-                retrieved_contexts[qid] = docs
-
-                ranked = await self._run_reranker_single(query_text, docs)
-                reranked_contexts[qid] = ranked
-
-                if (i + 1) % 10 == 0:
-                    print(f"    {i + 1}/{len(queries)} queries processed")
-
-            except Exception as e:
-                print(f"    [ERROR] Query {qid}: {str(e)[:80]}")
-                retrieved_contexts[qid] = []
-                reranked_contexts[qid] = []
+        if errors:
+            print(f"    Completed with {errors} errors")
 
         return retrieved_contexts, reranked_contexts
 
     # -------------------------------------------------------------------------
-    # Evaluation with Per-Example Tracking
+    # Evaluation with Per-Example Tracking (Parallel)
     # -------------------------------------------------------------------------
 
-    async def evaluate_split(
+    async def _evaluate_single_query(
         self,
-        queries: List[Dict],
-        reranked_contexts: Dict[str, List[str]],
-        description: str,
-        split: str,
-    ) -> EvaluationRecord:
-        """Evaluate a data split with per-example tracking."""
-        print(f"\n  Evaluating {split} split ({description})...")
+        q: Dict,
+        contexts: List[str],
+    ) -> Optional[PerExampleResult]:
+        """Evaluate a single query with generation and RAGAS metrics.
 
-        per_example_results: List[PerExampleResult] = []
-        all_scores: List[float] = []
-        all_metrics: Dict[str, List[float]] = defaultdict(list)
+        Returns:
+            PerExampleResult or None if evaluation failed
+        """
+        qid = q["query_id"]
+        query_text = q["query"]
+        ground_truth = q.get("ground_truth", "")
 
-        for i, q in enumerate(queries):
-            qid = q["query_id"]
-            query_text = q["query"]
-            ground_truth = q.get("ground_truth", "")
-            contexts = reranked_contexts.get(qid, [])
+        if not contexts:
+            return None
 
-            if not contexts:
-                continue
-
+        async with self.semaphore:
             try:
                 # Generate answer
                 context_text = "\n\n".join(contexts)
@@ -663,13 +698,8 @@ class ResearchExperimentRunner:
                 )
 
                 overall = scores.get("overall_quality", 0.0)
-                all_scores.append(overall)
 
-                for k, v in scores.items():
-                    if isinstance(v, (int, float)):
-                        all_metrics[k].append(v)
-
-                per_example_results.append(PerExampleResult(
+                return PerExampleResult(
                     query_id=qid,
                     query=query_text,
                     ground_truth=ground_truth,
@@ -677,13 +707,44 @@ class ResearchExperimentRunner:
                     metrics=scores,
                     answer=answer,
                     contexts=contexts[:3],  # Store top 3 for analysis
-                ))
-
-                if (i + 1) % 5 == 0:
-                    print(f"    {i + 1}/{len(queries)} evaluated")
+                )
 
             except Exception as e:
                 print(f"    [ERROR] {qid}: {str(e)[:80]}")
+                return None
+
+    async def evaluate_split(
+        self,
+        queries: List[Dict],
+        reranked_contexts: Dict[str, List[str]],
+        description: str,
+        split: str,
+    ) -> EvaluationRecord:
+        """Evaluate a data split with per-example tracking and parallel processing."""
+        print(f"\n  Evaluating {split} split ({description}, concurrency={self.max_concurrent})...")
+
+        # Create tasks for all queries
+        tasks = [
+            self._evaluate_single_query(q, reranked_contexts.get(q["query_id"], []))
+            for q in queries
+        ]
+
+        # Run all tasks concurrently with progress bar
+        results = await tqdm_asyncio.gather(
+            *tasks,
+            desc=f"    Evaluating queries",
+            total=len(tasks),
+        )
+
+        # Collect results (filter None values from failed evaluations)
+        per_example_results: List[PerExampleResult] = [r for r in results if r is not None]
+        all_scores: List[float] = [r.score for r in per_example_results]
+        all_metrics: Dict[str, List[float]] = defaultdict(list)
+
+        for r in per_example_results:
+            for k, v in r.metrics.items():
+                if isinstance(v, (int, float)):
+                    all_metrics[k].append(v)
 
         # Compute statistics
         mean, ci_lower, ci_upper = compute_confidence_interval(all_scores)
@@ -953,7 +1014,7 @@ class ResearchExperimentRunner:
 
         checkpoint = PhaseCheckpoint(
             phase=1,
-            timestamp=datetime.now().isoformat(),
+                timestamp=datetime.now().isoformat(),
             train_query_ids=prev_checkpoint.train_query_ids,
             val_query_ids=prev_checkpoint.val_query_ids,
             test_query_ids=prev_checkpoint.test_query_ids,
@@ -1067,18 +1128,26 @@ class ResearchExperimentRunner:
         checkpoint.prompts["reranker"] = result.best_prompt
 
         # Regenerate reranked contexts with optimized M2
-        print(f"\n  [CASCADE] Regenerating reranked contexts with optimized M2...")
+        print(f"\n  [CASCADE] Regenerating reranked contexts with optimized M2 (concurrency={self.max_concurrent})...")
 
-        new_reranked: Dict[str, List[str]] = {}
-        for q in self.train_queries + self.val_queries:
+        async def rerank_single(q: Dict, docs: List[str]) -> Tuple[str, List[str]]:
             qid = q["query_id"]
-            docs = prev_checkpoint.retrieved_contexts.get(qid, [])
-            if docs:
+            if not docs:
+                return (qid, [])
+            async with self.semaphore:
                 try:
                     ranked = await self._run_reranker_single(q["query"], docs)
-                    new_reranked[qid] = ranked
-                except Exception as e:
-                    new_reranked[qid] = docs[:self.rerank_k]
+                    return (qid, ranked)
+                except Exception:
+                    return (qid, docs[:self.rerank_k])
+
+        queries = self.train_queries + self.val_queries
+        tasks = [
+            rerank_single(q, prev_checkpoint.retrieved_contexts.get(q["query_id"], []))
+            for q in queries
+        ]
+        results = await tqdm_asyncio.gather(*tasks, desc="    Reranking", total=len(tasks))
+        new_reranked = {qid: docs for qid, docs in results}
 
         checkpoint.reranked_contexts = new_reranked
 
@@ -1093,7 +1162,7 @@ class ResearchExperimentRunner:
 
         checkpoint = PhaseCheckpoint(
             phase=3,
-            timestamp=datetime.now().isoformat(),
+                timestamp=datetime.now().isoformat(),
             train_query_ids=prev_checkpoint.train_query_ids,
             val_query_ids=prev_checkpoint.val_query_ids,
             test_query_ids=prev_checkpoint.test_query_ids,
@@ -1312,7 +1381,7 @@ class ResearchExperimentRunner:
             for name in ["query_planner", "reranker", "generator"]:
                 if name in checkpoint.module_results:
                     r = checkpoint.module_results[name]
-                    writer.writerow([
+            writer.writerow([
                         name,
                         f"{r['baseline_score']:.4f}",
                         f"[{r['baseline_ci_lower']:.4f}, {r['baseline_ci_upper']:.4f}]",
@@ -1586,6 +1655,7 @@ async def main(args):
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
+        max_concurrent=args.max_concurrent,
     )
 
     await runner.run_experiment(
@@ -1617,6 +1687,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_overlap", type=int, default=50)
     parser.add_argument("--retrieval_k", type=int, default=20)
     parser.add_argument("--rerank_k", type=int, default=10)
+    parser.add_argument("--max_concurrent", type=int, default=10,
+                        help="Max concurrent API calls (default: 10)")
 
     args = parser.parse_args()
     asyncio.run(main(args))
