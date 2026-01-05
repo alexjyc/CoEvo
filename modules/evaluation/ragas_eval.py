@@ -558,10 +558,10 @@ class RAGASEvaluator(ModuleEvaluator):
         relevant_chunk_indices: Optional[List[int]] = None,
     ) -> Dict[str, float]:
         """
-        Evaluate complete RAG pipeline output.
+        Evaluate complete RAG pipeline output with PARALLEL metric evaluation.
 
-        Returns all metrics for retrieval and generation.
-        
+        Runs all LLM-based metrics concurrently for ~4x speedup.
+
         Args:
             query: The user query
             contexts: Retrieved context texts
@@ -571,36 +571,37 @@ class RAGASEvaluator(ModuleEvaluator):
             relevant_chunk_indices: Ground truth relevant chunk indices
         """
         scores = {}
-        
+
         # Validate inputs - ensure contexts is a non-empty list of strings
         if not contexts or not isinstance(contexts, (list, tuple)):
             contexts = ["No context retrieved."]
         else:
-            # Convert all items to strings, filtering empty/None values
             validated_contexts = []
             for c in contexts:
                 if c is not None:
                     c_str = str(c) if not isinstance(c, str) else c
-                    if c_str.strip():  # Only add non-empty strings
+                    if c_str.strip():
                         validated_contexts.append(c_str)
             contexts = validated_contexts if validated_contexts else ["No context retrieved."]
-            
+
         # Ensure query is a string
         if not isinstance(query, str):
             query = str(query) if query else "No query provided."
-            
+
         # Ensure answer and ground_truth are strings
         if not isinstance(answer, str):
             answer = str(answer) if answer else "No answer generated."
         if not answer.strip():
             answer = "No answer generated."
-            
+
         if ground_truth is not None and not isinstance(ground_truth, str):
             ground_truth = str(ground_truth) if ground_truth else None
         if ground_truth and not ground_truth.strip():
             ground_truth = None
 
-        # Chunk-level retrieval metrics (PRIMARY - correct level for RAG retrieval)
+        has_valid_contexts = len(contexts) > 0 and contexts[0] != "No context retrieved."
+
+        # Chunk-level retrieval metrics (fast, non-LLM)
         if retrieved_chunk_indices and relevant_chunk_indices:
             try:
                 sample = SingleTurnSample(
@@ -617,62 +618,80 @@ class RAGASEvaluator(ModuleEvaluator):
                 scores['retrieval_precision'] = 0.0
                 scores['retrieval_recall'] = 0.0
 
-        # Context quality (LLM-based) - only if we have real contexts and ground truth
-        if ground_truth and len(contexts) > 0 and contexts[0] != "No context retrieved.":
-            scores['context_precision'] = await self._call_metric(
+        # Build list of parallel LLM metric tasks
+        metric_tasks = []
+        metric_names = []
+
+        # Context quality metrics (require ground_truth and valid contexts)
+        if ground_truth and has_valid_contexts:
+            metric_tasks.append(self._call_metric(
                 'context_precision',
                 user_input=query,
                 retrieved_contexts=contexts,
                 reference=ground_truth,
-            )
-            scores['context_recall'] = await self._call_metric(
+            ))
+            metric_names.append('context_precision')
+
+            metric_tasks.append(self._call_metric(
                 'context_recall',
                 user_input=query,
                 retrieved_contexts=contexts,
                 reference=ground_truth,
-            )
-        else:
-            scores['context_precision'] = 0.0
-            scores['context_recall'] = 0.0
+            ))
+            metric_names.append('context_recall')
 
-        # Generation metrics - only if we have real contexts
-        if len(contexts) > 0 and contexts[0] != "No context retrieved.":
-            scores['faithfulness'] = await self._call_metric(
+        # Faithfulness (requires valid contexts)
+        if has_valid_contexts:
+            metric_tasks.append(self._call_metric(
                 'faithfulness',
                 user_input=query,
                 response=answer,
                 retrieved_contexts=contexts,
-            )
-        else:
-            scores['faithfulness'] = 0.0
+            ))
+            metric_names.append('faithfulness')
 
+        # Answer correctness (requires ground_truth)
         if ground_truth:
-            scores['answer_correctness'] = await self._call_metric(
+            metric_tasks.append(self._call_metric(
                 'answer_correctness',
                 user_input=query,
                 response=answer,
                 reference=ground_truth,
-            )
-        else:
-            scores['answer_correctness'] = 0.0
+            ))
+            metric_names.append('answer_correctness')
+
+        # Run all metrics in PARALLEL
+        if metric_tasks:
+            results = await asyncio.gather(*metric_tasks, return_exceptions=True)
+            for name, result in zip(metric_names, results):
+                if isinstance(result, Exception):
+                    print(f"Error in {name}: {result}")
+                    scores[name] = 0.0
+                else:
+                    scores[name] = result
+
+        # Fill in defaults for missing metrics
+        scores.setdefault('context_precision', 0.0)
+        scores.setdefault('context_recall', 0.0)
+        scores.setdefault('faithfulness', 0.0)
+        scores.setdefault('answer_correctness', 0.0)
 
         # Calculate aggregate scores
         if 'retrieval_precision' in scores and 'retrieval_recall' in scores:
             p, r = scores['retrieval_precision'], scores['retrieval_recall']
             scores['retrieval_f1'] = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
-        if 'context_precision' in scores and 'context_recall' in scores:
-            p, r = scores['context_precision'], scores['context_recall']
-            scores['context_f1'] = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        p, r = scores['context_precision'], scores['context_recall']
+        scores['context_f1'] = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
         scores['generation_quality'] = (
-            scores.get('faithfulness', 0) + scores.get('answer_correctness', 0)
+            scores['faithfulness'] + scores['answer_correctness']
         ) / 2
 
         # Overall quality (weighted)
         scores['overall_quality'] = (
-            scores.get('retrieval_f1', scores.get('context_f1', 0)) * 0.3 +
-            scores.get('context_f1', 0) * 0.2 +
+            scores.get('retrieval_f1', scores['context_f1']) * 0.3 +
+            scores['context_f1'] * 0.2 +
             scores['generation_quality'] * 0.5
         )
 

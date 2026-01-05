@@ -24,33 +24,9 @@ Usage with gepa.optimize():
 """
 
 import asyncio
-import atexit
-import gc
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, TypeVar, TypedDict
-
-# Suppress semaphore leak warnings at shutdown
-def _cleanup_multiprocessing():
-    """Clean up multiprocessing resources to avoid semaphore leak warnings."""
-    try:
-        # Force garbage collection before shutdown
-        gc.collect()
-        # Suppress the resource_tracker warning
-        import multiprocessing.resource_tracker
-        multiprocessing.resource_tracker._resource_tracker._stop = lambda *args, **kwargs: None
-    except Exception:
-        pass
-
-atexit.register(_cleanup_multiprocessing)
-
-# Set multiprocessing start method to 'spawn' to avoid fork-related issues on macOS
-try:
-    import multiprocessing
-    if multiprocessing.get_start_method(allow_none=True) is None:
-        multiprocessing.set_start_method('spawn')
-except RuntimeError:
-    pass  # Already set
 
 # Import GEPA types - use actual library when available
 try:

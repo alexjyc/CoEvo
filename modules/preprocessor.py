@@ -2,15 +2,26 @@
 Enhanced Preprocessor Module for RAG Pipeline with Contextual Retrieval
 Implements Anthropic's Contextual Retrieval approach to improve chunk retrieval accuracy
 Reference: https://www.anthropic.com/engineering/contextual-retrieval
+
+Optimizations:
+- AsyncOpenAI client for non-blocking API calls
+- Parallel batch processing for embeddings
+- Optimal batch size (512) for throughput
 """
 
 import os
+# Fix OpenMP conflict on macOS - must be set before importing faiss/numpy
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import asyncio
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from sklearn.cluster import KMeans
 import faiss
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rank_bm25 import BM25Okapi
@@ -44,7 +55,9 @@ class DocumentPreprocessor:
                  chunk_overlap: int = 80,
                  contextualizer_model: str = "gpt-5-nano",
                  embedding_model: str = "text-embedding-3-small",
-                 max_workers: int = 5):
+                 max_workers: int = 5,
+                 embedding_batch_size: int = 512,
+                 max_concurrent_batches: int = 5):
         """
         Initialize the enhanced preprocessor with contextual retrieval support
 
@@ -54,13 +67,19 @@ class DocumentPreprocessor:
             contextualizer_model: OpenAI model for generating chunk context
             embedding_model: OpenAI model for generating embeddings
             max_workers: Maximum concurrent workers for contextualization
+            embedding_batch_size: Batch size for embedding generation (default 512, max 2048)
+            max_concurrent_batches: Max concurrent embedding API calls (default 5)
         """
-        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        api_key = os.getenv('OPENAI_API_KEY')
+        self.client = OpenAI(api_key=api_key, timeout=60.0)
+        self.async_client = AsyncOpenAI(api_key=api_key, timeout=60.0, max_retries=2)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.contextualizer_model = contextualizer_model
         self.embedding_model = embedding_model
         self.max_workers = max_workers
+        self.embedding_batch_size = min(embedding_batch_size, 2048)  # OpenAI limit
+        self.max_concurrent_batches = max_concurrent_batches
         self.use_contextual_retrieval = False
 
         # Storage
@@ -216,28 +235,46 @@ class DocumentPreprocessor:
     
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
-        Generate embeddings for a list of texts using OpenAI's embedding model.
-        Supports batch processing for better performance.
+        Generate embeddings using async parallel batch processing.
 
-        Handles invalid texts (None, empty, whitespace-only) by using zero vectors
-        while maintaining 1:1 correspondence between input and output indices.
-
-        Args:
-            texts: List of text strings to embed
-
-        Returns:
-            List of embedding vectors (same length as input texts)
+        This is a sync wrapper that runs the async version.
+        For direct async usage, call generate_embeddings_async().
         """
+        import nest_asyncio
+
+        try:
+            # Try to apply nest_asyncio to allow nested event loops
+            nest_asyncio.apply()
+        except Exception:
+            pass
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            # Already in async context - use nest_asyncio
+            try:
+                return loop.run_until_complete(self.generate_embeddings_async(texts))
+            except RuntimeError:
+                # Fallback to synchronous processing
+                return self._generate_embeddings_sync(texts)
+        else:
+            # No running loop - create new one
+            return asyncio.run(self.generate_embeddings_async(texts))
+
+    def _generate_embeddings_sync(self, texts: List[str]) -> List[List[float]]:
+        """Fallback synchronous embedding generation with retry logic."""
         embeddings = []
-        batch_size = 128  # OpenAI supports up to 2048 inputs per request
+        batch_size = self.embedding_batch_size
         embedding_dim = 1536 if "3-small" in self.embedding_model else 3072
 
-        print(f"Generating embeddings for {len(texts)} texts in batches of {batch_size}...")
+        print(f"Generating embeddings (sync fallback) for {len(texts)} texts...")
 
         for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
             batch = texts[i:i + batch_size]
 
-            # Identify valid texts and their positions within this batch
             valid_texts = []
             valid_positions = []
             for pos, text in enumerate(batch):
@@ -246,34 +283,197 @@ class DocumentPreprocessor:
                     valid_positions.append(pos)
 
             if not valid_texts:
-                # All items in batch are invalid - add zero vectors for each
                 embeddings.extend([[0.0] * embedding_dim for _ in batch])
                 continue
 
-            try:
-                response = self.client.embeddings.create(
-                    input=valid_texts,
-                    model=self.embedding_model
-                )
+            # Retry logic with exponential backoff
+            max_retries = 5
+            base_delay = 1.0
 
-                # Build position -> embedding mapping
-                response_embeddings = [data.embedding for data in response.data]
-                pos_to_embedding = dict(zip(valid_positions, response_embeddings))
+            for attempt in range(max_retries):
+                try:
+                    response = self.client.embeddings.create(
+                        input=valid_texts,
+                        model=self.embedding_model
+                    )
 
-                # Generate embeddings preserving original order
-                # Invalid texts get zero vectors, valid texts get their embeddings
-                for pos in range(len(batch)):
-                    if pos in pos_to_embedding:
-                        embeddings.append(pos_to_embedding[pos])
+                    response_embeddings = [data.embedding for data in response.data]
+                    pos_to_embedding = dict(zip(valid_positions, response_embeddings))
+
+                    for pos in range(len(batch)):
+                        if pos in pos_to_embedding:
+                            embeddings.append(pos_to_embedding[pos])
+                        else:
+                            embeddings.append([0.0] * embedding_dim)
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_rate_limit = '429' in error_str or 'rate limit' in error_str
+                    is_connection = 'connection' in error_str or 'timeout' in error_str
+
+                    if (is_rate_limit or is_connection) and attempt < max_retries - 1:
+                        import time
+                        delay = base_delay * (2 ** attempt)
+                        print(f"  Retry {attempt + 1}/{max_retries} after {delay:.1f}s: {str(e)[:50]}...")
+                        time.sleep(delay)
                     else:
-                        embeddings.append([0.0] * embedding_dim)
-
-            except Exception as e:
-                print(f"Error generating embeddings for batch {i//batch_size}: {e}")
-                # Add zero vectors as placeholders for entire batch
-                embeddings.extend([[0.0] * embedding_dim for _ in batch])
+                        print(f"Error in batch {i//batch_size}: {e}")
+                        embeddings.extend([[0.0] * embedding_dim for _ in batch])
+                        break
 
         return embeddings
+
+    async def generate_embeddings_async(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings using AsyncOpenAI with parallel batch processing.
+
+        Optimizations:
+        - Uses AsyncOpenAI for non-blocking API calls
+        - Processes multiple batches in parallel (controlled by max_concurrent_batches)
+        - Larger batch size (512 default) for better throughput
+
+        Args:
+            texts: List of text strings to embed
+
+        Returns:
+            List of embedding vectors (same length as input texts)
+        """
+        embedding_dim = 1536 if "3-small" in self.embedding_model else 3072
+        batch_size = self.embedding_batch_size
+        n_texts = len(texts)
+
+        if n_texts == 0:
+            return []
+
+        print(f"Generating embeddings for {n_texts} texts (batch_size={batch_size}, concurrency={self.max_concurrent_batches})...")
+
+        # Prepare all batches
+        batches = []
+        for i in range(0, n_texts, batch_size):
+            batch = texts[i:i + batch_size]
+            batches.append((i, batch))
+
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(self.max_concurrent_batches)
+
+        async def process_batch(batch_idx: int, batch: List[str]) -> tuple:
+            """Process a single batch with retry logic for rate limits."""
+            async with semaphore:
+                # Identify valid texts and their positions
+                valid_texts = []
+                valid_positions = []
+                for pos, text in enumerate(batch):
+                    if text and isinstance(text, str) and text.strip():
+                        valid_texts.append(text)
+                        valid_positions.append(pos)
+
+                if not valid_texts:
+                    return (batch_idx, [[0.0] * embedding_dim for _ in batch])
+
+                # Retry logic with exponential backoff for rate limits
+                max_retries = 5
+                base_delay = 1.0
+
+                for attempt in range(max_retries):
+                    try:
+                        response = await self.async_client.embeddings.create(
+                            input=valid_texts,
+                            model=self.embedding_model
+                        )
+
+                        # Build position -> embedding mapping
+                        response_embeddings = [data.embedding for data in response.data]
+                        pos_to_embedding = dict(zip(valid_positions, response_embeddings))
+
+                        # Generate embeddings preserving original order
+                        batch_embeddings = []
+                        for pos in range(len(batch)):
+                            if pos in pos_to_embedding:
+                                batch_embeddings.append(pos_to_embedding[pos])
+                            else:
+                                batch_embeddings.append([0.0] * embedding_dim)
+
+                        return (batch_idx, batch_embeddings)
+
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        is_rate_limit = '429' in error_str or 'rate limit' in error_str
+                        is_connection = 'connection' in error_str or 'timeout' in error_str or 'network' in error_str
+
+                        if (is_rate_limit or is_connection) and attempt < max_retries - 1:
+                            # Exponential backoff with jitter
+                            delay = base_delay * (2 ** attempt) + (0.1 * batch_idx % 1)
+                            error_type = "Rate limit" if is_rate_limit else "Connection error"
+                            print(f"  {error_type} in batch {batch_idx}, retry {attempt + 1}/{max_retries}...")
+                            await asyncio.sleep(delay)
+                        else:
+                            print(f"Error in batch {batch_idx}: {e}")
+                            return (batch_idx, [[0.0] * embedding_dim for _ in batch])
+
+                return (batch_idx, [[0.0] * embedding_dim for _ in batch])
+
+        # Create all tasks
+        tasks = [process_batch(i, batch) for i, batch in batches]
+
+        # Run all tasks with progress bar
+        results = await tqdm_asyncio.gather(*tasks, desc="Embedding batches")
+
+        # Sort results by batch index and flatten
+        results.sort(key=lambda x: x[0])
+        embeddings = []
+        for _, batch_embeddings in results:
+            embeddings.extend(batch_embeddings)
+
+        return embeddings
+
+    async def embed_texts_batch_async(self, texts: List[str]) -> List[List[float]]:
+        """
+        Batch embed multiple texts in a single API call (for query embedding).
+
+        Args:
+            texts: List of text strings to embed
+
+        Returns:
+            List of embedding vectors
+        """
+        if not texts:
+            return []
+
+        embedding_dim = 1536 if "3-small" in self.embedding_model else 3072
+
+        # Filter valid texts
+        valid_texts = []
+        valid_indices = []
+        for i, text in enumerate(texts):
+            if text and isinstance(text, str) and text.strip():
+                valid_texts.append(text)
+                valid_indices.append(i)
+
+        if not valid_texts:
+            return [[0.0] * embedding_dim for _ in texts]
+
+        try:
+            response = await self.async_client.embeddings.create(
+                input=valid_texts,
+                model=self.embedding_model
+            )
+
+            # Build index -> embedding mapping
+            idx_to_embedding = dict(zip(
+                valid_indices,
+                [data.embedding for data in response.data]
+            ))
+
+            # Return embeddings in original order
+            return [
+                idx_to_embedding.get(i, [0.0] * embedding_dim)
+                for i in range(len(texts))
+            ]
+
+        except Exception as e:
+            print(f"Error batch embedding: {e}")
+            return [[0.0] * embedding_dim for _ in texts]
 
     def tokenize_text(self, text: str) -> List[str]:
         """
@@ -321,7 +521,7 @@ class DocumentPreprocessor:
             FAISS index for similarity search
         """
         embeddings_array = np.array(embeddings).astype(np.float32)
-        
+
         # Normalize embeddings for cosine similarity
         faiss.normalize_L2(embeddings_array)
         
@@ -415,7 +615,7 @@ class DocumentPreprocessor:
         
         return representatives
     
-    def process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
+    async def process_documents(self, documents: List[Dict[str, Any]], use_context: bool = True) -> None:
         """
         Process documents with enhanced contextual retrieval pipeline.
 
@@ -512,7 +712,7 @@ class DocumentPreprocessor:
         bm25_input = all_chunks
 
         print(f"Generating embeddings for {len(embedding_input)} {'contextualized ' if use_context else ''}chunks...")
-        self.embeddings = self.generate_embeddings(embedding_input)
+        self.embeddings = await self.generate_embeddings_async(embedding_input)
 
         print("Creating BM25 index...")
         self.bm25_index = self.create_bm25_index(bm25_input)

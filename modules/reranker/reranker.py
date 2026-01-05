@@ -90,8 +90,6 @@ Ranking Criteria:
 - Supporting context ranks third
 - Off-topic content ranks lowest
 
-{feedback}
-
 Query: {query}
 
 Rerank these documents:"""

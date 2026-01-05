@@ -406,6 +406,10 @@ class ResearchExperimentRunner:
         self.generator: Optional[GeneratorModule] = None
         self.evaluator: Optional[RAGASEvaluator] = None
 
+        # RRF Weight Optimization Results
+        self.optimal_rrf_weight: float = 0.5
+        self.rrf_weight_scores: Dict[float, Dict[str, float]] = {}
+
         # Results
         self.ablation_results: List[AblationResult] = []
         self.baseline_test_scores: List[float] = []  # For paired t-test
@@ -549,27 +553,67 @@ class ResearchExperimentRunner:
         print(f"  Config hash: {self.config_hash[:16]}...")
 
     async def setup_pipeline(self):
-        """Initialize pipeline components."""
+        """Initialize pipeline components with optimized settings."""
         print(f"\n{'='*70}")
-        print("  SETTING UP PIPELINE")
+        print("  SETTING UP PIPELINE (Optimized)")
         print(f"{'='*70}")
 
+        # Preprocessor with optimized embedding settings (conservative for rate limits)
         self.preprocessor = DocumentPreprocessor(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
+            embedding_batch_size=512,  # Balanced: good throughput, avoids rate limits
+            max_concurrent_batches=5,  # Conservative: stays under TPM limits
         )
-        self.preprocessor.process_documents(self.documents, use_context=False)
+        await self.preprocessor.process_documents(self.documents, use_context=False)
 
+        # Create chunk labels first (needed for retriever optimization)
+        self.chunk_labels = self.preprocessor.create_relevance_labels(self.all_queries)
+
+        # Initialize modules
         self.query_planner = QueryPlannerModule(model_name=self.model)
-        self.retriever = HybridRetriever(preprocessor=self.preprocessor)
-        self.reranker = RerankerModule(model_name=self.model)
-        self.generator = GeneratorModule(model_name=self.model)
         self.evaluator = RAGASEvaluator(model=self.model)
 
-        self.chunk_labels = self.preprocessor.create_relevance_labels(self.all_queries)
+        # Retriever with relevance labels for optimal RRF weight finding
+        self.retriever = HybridRetriever(
+            preprocessor=self.preprocessor,
+            relevance_labels=self.chunk_labels,
+            evaluator=self.evaluator,
+        )
+        # Set up query ID mapping for weight optimization
+        self.retriever.set_relevance_labels(self.all_queries, self.chunk_labels)
+
+        self.reranker = RerankerModule(model_name=self.model)
+        self.generator = GeneratorModule(model_name=self.model)
 
         print(f"  Preprocessor: {len(self.preprocessor.chunks)} chunks")
         print(f"  Chunk labels: {len(self.chunk_labels)} queries")
+        print(f"  Embedding batch size: {self.preprocessor.embedding_batch_size}")
+        print(f"  Max concurrent batches: {self.preprocessor.max_concurrent_batches}")
+
+        # Find optimal RRF weight using TRAINING set only (avoid data leakage)
+        await self._optimize_rrf_weight()
+
+    async def _optimize_rrf_weight(self):
+        """Find and set optimal RRF weight using training data."""
+        print(f"\n{'='*70}")
+        print("  OPTIMIZING RRF WEIGHT")
+        print(f"{'='*70}")
+
+        # Use only training queries to find optimal weight (no data leakage)
+        optimal_weight, weight_scores = await self.retriever.find_optimal_weight(
+            queries=self.train_queries,
+            top_k=self.retrieval_k,
+        )
+
+        # Set the optimal weight for all future retrieval
+        self.retriever.set_dense_weight(optimal_weight)
+
+        # Store results for reporting
+        self.optimal_rrf_weight = optimal_weight
+        self.rrf_weight_scores = weight_scores
+
+        print(f"\n  Retriever dense_weight set to: {self.retriever.dense_weight}")
 
     # -------------------------------------------------------------------------
     # Concurrency Control
@@ -1014,7 +1058,7 @@ class ResearchExperimentRunner:
 
         checkpoint = PhaseCheckpoint(
             phase=1,
-                timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now().isoformat(),
             train_query_ids=prev_checkpoint.train_query_ids,
             val_query_ids=prev_checkpoint.val_query_ids,
             test_query_ids=prev_checkpoint.test_query_ids,
@@ -1107,8 +1151,8 @@ class ResearchExperimentRunner:
             contexts = prev_checkpoint.retrieved_contexts.get(qid, [])
             if contexts:
                 val_data.append({
-                    "query": q["query"],
-                    "ground_truth": q.get("ground_truth", ""),
+                "query": q["query"],
+                "ground_truth": q.get("ground_truth", ""),
                     "relevant_chunk_indices": None,
                     "contexts": contexts,
                     "metadata": {"query_id": qid},
@@ -1162,7 +1206,7 @@ class ResearchExperimentRunner:
 
         checkpoint = PhaseCheckpoint(
             phase=3,
-                timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now().isoformat(),
             train_query_ids=prev_checkpoint.train_query_ids,
             val_query_ids=prev_checkpoint.val_query_ids,
             test_query_ids=prev_checkpoint.test_query_ids,
