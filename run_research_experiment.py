@@ -1,15 +1,16 @@
 """
-RAG Pipeline GEPA Optimization - Research Paper Quality Experiment Runner
+RAG Pipeline GEPA Optimization - Research Paper Quality Experiment Runner V2
 
-CRITICAL IMPROVEMENTS over previous version:
+CRITICAL IMPROVEMENTS:
 1. Proper train/val/test split (no data contamination)
-2. Consistent evaluation across all phases
-3. Statistical significance testing (CI, p-values)
-4. Per-example score tracking
-5. GEPA iteration history with reflections
-6. LaTeX table generation
-7. Reproducibility controls (seeds, config hash)
-8. Comprehensive ablation studies
+2. Iterative (Staged) Optimization: QP -> Reranker -> Generator
+3. Consistent evaluation across all phases
+4. Statistical significance testing (CI, p-values)
+5. Per-example score tracking
+6. GEPA iteration history with reflections
+7. LaTeX table generation
+8. Reproducibility controls (seeds, config hash)
+9. Comprehensive ablation studies
 
 Data Split Strategy:
 - Total queries: N
@@ -18,9 +19,7 @@ Data Split Strategy:
 - Test set: 20% (HELD OUT - only for final paper numbers)
 
 Usage:
-    python run_research_experiment_v2.py --experiment_name "paper_exp_001" --n_queries 100
-
-Author: RAG Optimization Research
+    python run_research_experiment_v2.py --experiment_name "paper_exp_002" --n_queries 100
 """
 
 import asyncio
@@ -86,7 +85,6 @@ def compute_confidence_interval(scores: List[float], confidence: float = 0.95) -
     std_err = statistics.stdev(scores) / math.sqrt(n)
 
     # t-value for 95% CI (approximation for n > 30, use 1.96)
-    # For smaller samples, should use scipy.stats.t.ppf
     if n >= 30:
         t_value = 1.96
     else:
@@ -120,7 +118,6 @@ def paired_ttest(scores1: List[float], scores2: List[float]) -> Tuple[float, flo
     t_stat = mean_diff / (std_diff / math.sqrt(n))
 
     # Approximate p-value (two-tailed)
-    # For proper p-value, use scipy.stats.t.sf
     df = n - 1
     p_approx = 2.0 * (1.0 - min(0.9999, abs(t_stat) / (abs(t_stat) + df)))
 
@@ -228,6 +225,9 @@ class ModuleOptimizationRecord:
 
     # Cost tracking
     llm_calls: int = 0
+
+    # Baseline check result
+    gepa_reverted_to_baseline: bool = False  # True if GEPA's best was worse than baseline
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -558,16 +558,16 @@ class ResearchExperimentRunner:
         print("  SETTING UP PIPELINE (Optimized)")
         print(f"{'='*70}")
 
-        # Preprocessor with optimized embedding settings (conservative for rate limits)
+        # Preprocessor with optimized embedding settings
         self.preprocessor = DocumentPreprocessor(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
-            embedding_batch_size=512,  # Balanced: good throughput, avoids rate limits
-            max_concurrent_batches=5,  # Conservative: stays under TPM limits
+            embedding_batch_size=512,
+            max_concurrent_batches=5,
         )
         await self.preprocessor.process_documents(self.documents, use_context=False)
 
-        # Create chunk labels first (needed for retriever optimization)
+        # Create chunk labels first
         self.chunk_labels = self.preprocessor.create_relevance_labels(self.all_queries)
 
         # Initialize modules
@@ -580,7 +580,6 @@ class ResearchExperimentRunner:
             relevance_labels=self.chunk_labels,
             evaluator=self.evaluator,
         )
-        # Set up query ID mapping for weight optimization
         self.retriever.set_relevance_labels(self.all_queries, self.chunk_labels)
 
         self.reranker = RerankerModule(model_name=self.model)
@@ -588,8 +587,6 @@ class ResearchExperimentRunner:
 
         print(f"  Preprocessor: {len(self.preprocessor.chunks)} chunks")
         print(f"  Chunk labels: {len(self.chunk_labels)} queries")
-        print(f"  Embedding batch size: {self.preprocessor.embedding_batch_size}")
-        print(f"  Max concurrent batches: {self.preprocessor.max_concurrent_batches}")
 
         # Find optimal RRF weight using TRAINING set only (avoid data leakage)
         await self._optimize_rrf_weight()
@@ -600,7 +597,7 @@ class ResearchExperimentRunner:
         print("  OPTIMIZING RRF WEIGHT")
         print(f"{'='*70}")
 
-        # Use only training queries to find optimal weight (no data leakage)
+        # Use only training queries to find optimal weight
         optimal_weight, weight_scores = await self.retriever.find_optimal_weight(
             queries=self.train_queries,
             top_k=self.retrieval_k,
@@ -608,8 +605,6 @@ class ResearchExperimentRunner:
 
         # Set the optimal weight for all future retrieval
         self.retriever.set_dense_weight(optimal_weight)
-
-        # Store results for reporting
         self.optimal_rrf_weight = optimal_weight
         self.rrf_weight_scores = weight_scores
 
@@ -621,7 +616,7 @@ class ResearchExperimentRunner:
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
-        """Lazy initialization of semaphore to avoid event loop issues."""
+        """Lazy initialization of semaphore."""
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.max_concurrent)
         return self._semaphore
@@ -654,11 +649,7 @@ class ResearchExperimentRunner:
         self,
         q: Dict,
     ) -> Tuple[str, List[str], List[str], Optional[str]]:
-        """Process a single query through planning, retrieval, and reranking.
-
-        Returns:
-            Tuple of (query_id, retrieved_docs, reranked_docs, error_message)
-        """
+        """Process a single query through planning, retrieval, and reranking."""
         qid = q["query_id"]
         query_text = q["query"]
 
@@ -715,11 +706,7 @@ class ResearchExperimentRunner:
         q: Dict,
         contexts: List[str],
     ) -> Optional[PerExampleResult]:
-        """Evaluate a single query with generation and RAGAS metrics.
-
-        Returns:
-            PerExampleResult or None if evaluation failed
-        """
+        """Evaluate a single query with generation and RAGAS metrics."""
         qid = q["query_id"]
         query_text = q["query"]
         ground_truth = q.get("ground_truth", "")
@@ -750,7 +737,7 @@ class ResearchExperimentRunner:
                     score=overall,
                     metrics=scores,
                     answer=answer,
-                    contexts=contexts[:3],  # Store top 3 for analysis
+                    contexts=contexts[:3],
                 )
 
             except Exception as e:
@@ -773,14 +760,14 @@ class ResearchExperimentRunner:
             for q in queries
         ]
 
-        # Run all tasks concurrently with progress bar
+        # Run all tasks concurrently
         results = await tqdm_asyncio.gather(
             *tasks,
             desc=f"    Evaluating queries",
             total=len(tasks),
         )
 
-        # Collect results (filter None values from failed evaluations)
+        # Collect results
         per_example_results: List[PerExampleResult] = [r for r in results if r is not None]
         all_scores: List[float] = [r.score for r in per_example_results]
         all_metrics: Dict[str, List[float]] = defaultdict(list)
@@ -847,7 +834,7 @@ class ResearchExperimentRunner:
         # Save seed
         self._save_prompt(module_name, seed_prompt, "seed")
 
-        # Baseline evaluation with per-example scores
+        # Baseline evaluation
         print(f"\n  Baseline evaluation on validation set...")
         baseline_batch = await self._evaluate_with_retry(adapter, val_data, seed_candidate)
         baseline_scores = baseline_batch.scores
@@ -863,33 +850,42 @@ class ResearchExperimentRunner:
         total_iterations = 0
         accepted_iterations = 0
 
+        gepa_reverted_to_baseline = False
+
         if GEPA_AVAILABLE:
             try:
-                best_prompt, best_scores, iteration_history = await self._run_gepa_with_tracking(
+                gepa_prompt, gepa_scores, iteration_history = await self._run_gepa_with_tracking(
                     adapter, train_data, val_data, module_name
                 )
-                best_mean, _, _ = compute_confidence_interval(best_scores)
+                gepa_mean, _, _ = compute_confidence_interval(gepa_scores)
                 total_iterations = len(iteration_history)
                 accepted_iterations = sum(1 for r in iteration_history if r.accepted)
+
+                # BASELINE CHECK
+                if gepa_mean > baseline_mean:
+                    best_prompt = gepa_prompt
+                    best_scores = gepa_scores
+                    best_mean = gepa_mean
+                    print(f"  [GEPA] Accepted: {gepa_mean:.4f} > baseline {baseline_mean:.4f}")
+                else:
+                    best_prompt = seed_prompt
+                    best_scores = baseline_scores
+                    best_mean = baseline_mean
+                    gepa_reverted_to_baseline = True
+                    print(f"  [GEPA] REJECTED: {gepa_mean:.4f} <= baseline {baseline_mean:.4f}")
+
             except Exception as e:
                 print(f"  [ERROR] GEPA optimization failed: {e}")
                 import traceback
                 traceback.print_exc()
         else:
             print(f"  [SIMULATION] GEPA not available")
-            # Simulate for testing
-            best_prompt = seed_prompt + "\n# [Simulated optimization]"
-            improvement = 0.05
-            best_scores = [min(1.0, s + improvement) for s in baseline_scores]
-            best_mean = statistics.mean(best_scores)
-            total_iterations = 5
-            accepted_iterations = 3
 
         # Apply best prompt
         adapter.module._prompt = best_prompt
-        self._save_prompt(module_name, best_prompt, "best")
+        self._save_prompt(module_name, best_prompt, "best" if not gepa_reverted_to_baseline else "best_reverted_to_seed")
 
-        # Compute improvement with significance
+        # Compute stats
         best_ci_lower, best_ci_upper = compute_confidence_interval(best_scores)[1:]
         improvement_abs = best_mean - baseline_mean
         improvement_pct = (improvement_abs / baseline_mean * 100) if baseline_mean > 0 else 0
@@ -924,16 +920,8 @@ class ResearchExperimentRunner:
             total_iterations=total_iterations,
             accepted_iterations=accepted_iterations,
             iteration_history=iteration_history,
+            gepa_reverted_to_baseline=gepa_reverted_to_baseline,
         )
-
-        # Print summary
-        sig_marker = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else ""
-        print(f"\n  Optimization Complete:")
-        print(f"    Baseline: {baseline_mean:.4f} [{baseline_ci_lower:.4f}, {baseline_ci_upper:.4f}]")
-        print(f"    Best:     {best_mean:.4f} [{best_ci_lower:.4f}, {best_ci_upper:.4f}]")
-        print(f"    Improvement: {improvement_abs:+.4f} ({improvement_pct:+.1f}%) {sig_marker}")
-        print(f"    t-statistic: {t_stat:.3f}, p-value: {p_value:.4f}")
-        print(f"    Iterations: {accepted_iterations}/{total_iterations} accepted")
 
         return record
 
@@ -959,8 +947,6 @@ class ResearchExperimentRunner:
         print(f"  Running GEPA optimization (budget={self.optimization_budget})...")
 
         seed_candidate = adapter.get_candidate()
-
-        # Track iterations via callback if GEPA supports it
         iteration_history: List[GEPAIterationRecord] = []
 
         gepa_result = optimize(
@@ -972,15 +958,14 @@ class ResearchExperimentRunner:
             reflection_lm=f"openai/{self.model}",
         )
 
-        # Extract results
         best_candidate = getattr(gepa_result, 'best_candidate', {})
         best_prompt = best_candidate.get(adapter.component_name, "") if isinstance(best_candidate, dict) else ""
 
-        # Evaluate best prompt to get per-example scores
+        # Evaluate best prompt
         best_batch = await adapter._evaluate_async(val_data, best_candidate, capture_traces=False)
         best_scores = best_batch.scores
 
-        # Try to extract iteration history from GEPA result
+        # Try to extract iteration history
         candidates = getattr(gepa_result, 'candidates', [])
         val_scores = getattr(gepa_result, 'val_aggregate_scores', [])
 
@@ -991,13 +976,11 @@ class ResearchExperimentRunner:
                 timestamp=datetime.now().isoformat(),
                 prompt_hash=hashlib.md5(prompt_text.encode()).hexdigest()[:12],
                 prompt_text=prompt_text,
-                train_score=0.0,  # Not available from result
+                train_score=0.0,
                 val_score=score,
                 accepted=i == getattr(gepa_result, 'best_idx', 0),
             )
             iteration_history.append(record)
-
-            # Save each iteration prompt
             self._save_prompt(module_name, prompt_text, f"iter_{i+1:03d}")
 
         return best_prompt, best_scores, iteration_history
@@ -1015,7 +998,7 @@ class ResearchExperimentRunner:
     async def phase_0_baseline(self) -> PhaseCheckpoint:
         """Phase 0: Data split and baseline capture."""
         print(f"\n{'='*80}")
-        print(f"  PHASE 0: DATA SPLIT & BASELINE CAPTURE")
+        print("  PHASE 0: DATA SPLIT & BASELINE CAPTURE")
         print(f"{'='*80}")
 
         checkpoint = PhaseCheckpoint(
@@ -1026,14 +1009,12 @@ class ResearchExperimentRunner:
             test_query_ids=[q["query_id"] for q in self.test_queries],
         )
 
-        # Store seed prompts
         checkpoint.prompts = {
             "query_planner": self.query_planner.prompt or self.query_planner.get_default_prompt(),
             "reranker": self.reranker.prompt or self.reranker.get_default_prompt(),
             "generator": self.generator.prompt or self.generator.get_default_prompt(),
         }
 
-        # Generate contexts for train+val (NOT test - held out)
         train_val_queries = self.train_queries + self.val_queries
         retrieved, reranked = await self.generate_contexts_for_split(
             train_val_queries, "baseline_train_val"
@@ -1041,7 +1022,6 @@ class ResearchExperimentRunner:
         checkpoint.retrieved_contexts = retrieved
         checkpoint.reranked_contexts = reranked
 
-        # Baseline evaluation on VAL set only
         val_eval = await self.evaluate_split(
             self.val_queries, reranked, "baseline", "val"
         )
@@ -1053,7 +1033,7 @@ class ResearchExperimentRunner:
     async def phase_1_query_planner(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 1: Optimize Query Planner."""
         print(f"\n{'='*80}")
-        print(f"  PHASE 1: QUERY PLANNER OPTIMIZATION")
+        print("  PHASE 1: QUERY PLANNER OPTIMIZATION")
         print(f"{'='*80}")
 
         checkpoint = PhaseCheckpoint(
@@ -1115,7 +1095,7 @@ class ResearchExperimentRunner:
     async def phase_2_reranker(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 2: Optimize Reranker."""
         print(f"\n{'='*80}")
-        print(f"  PHASE 2: RERANKER OPTIMIZATION")
+        print("  PHASE 2: RERANKER OPTIMIZATION")
         print(f"{'='*80}")
 
         checkpoint = PhaseCheckpoint(
@@ -1131,7 +1111,23 @@ class ResearchExperimentRunner:
             evaluations=prev_checkpoint.evaluations.copy(),
         )
 
-        # Prepare data with FRESH contexts from M1
+        # Build chunk mapping
+        chunk_text_to_idx = {}
+        for idx, chunk in enumerate(self.preprocessor.chunks):
+            # Chunks are strings, not dicts
+            chunk_text = chunk[:200] if chunk else ""
+            if chunk_text and chunk_text not in chunk_text_to_idx:
+                chunk_text_to_idx[chunk_text] = idx
+
+        def get_chunk_indices(docs: List[str]) -> List[int]:
+            indices = []
+            for doc in docs:
+                doc_key = doc[:200] if doc else ""
+                idx = chunk_text_to_idx.get(doc_key, -1)
+                indices.append(idx)
+            return indices
+
+        # Prepare data with FRESH contexts
         train_data = []
         for q in self.train_queries:
             qid = q["query_id"]
@@ -1140,8 +1136,9 @@ class ResearchExperimentRunner:
                 train_data.append({
                     "query": q["query"],
                     "ground_truth": q.get("ground_truth", ""),
-                    "relevant_chunk_indices": None,
+                    "relevant_chunk_indices": self.chunk_labels.get(qid, []),
                     "contexts": contexts,
+                    "context_chunk_indices": get_chunk_indices(contexts),
                     "metadata": {"query_id": qid},
                 })
 
@@ -1151,14 +1148,13 @@ class ResearchExperimentRunner:
             contexts = prev_checkpoint.retrieved_contexts.get(qid, [])
             if contexts:
                 val_data.append({
-                "query": q["query"],
-                "ground_truth": q.get("ground_truth", ""),
-                    "relevant_chunk_indices": None,
+                    "query": q["query"],
+                    "ground_truth": q.get("ground_truth", ""),
+                    "relevant_chunk_indices": self.chunk_labels.get(qid, []),
                     "contexts": contexts,
+                    "context_chunk_indices": get_chunk_indices(contexts),
                     "metadata": {"query_id": qid},
                 })
-
-        print(f"  Using fresh contexts from optimized M1")
 
         # Optimize
         adapter = RerankerAdapter(
@@ -1172,7 +1168,7 @@ class ResearchExperimentRunner:
         checkpoint.prompts["reranker"] = result.best_prompt
 
         # Regenerate reranked contexts with optimized M2
-        print(f"\n  [CASCADE] Regenerating reranked contexts with optimized M2 (concurrency={self.max_concurrent})...")
+        print(f"\n  [CASCADE] Regenerating reranked contexts with optimized M2...")
 
         async def rerank_single(q: Dict, docs: List[str]) -> Tuple[str, List[str]]:
             qid = q["query_id"]
@@ -1201,7 +1197,7 @@ class ResearchExperimentRunner:
     async def phase_3_generator(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 3: Optimize Generator."""
         print(f"\n{'='*80}")
-        print(f"  PHASE 3: GENERATOR OPTIMIZATION")
+        print("  PHASE 3: GENERATOR OPTIMIZATION")
         print(f"{'='*80}")
 
         checkpoint = PhaseCheckpoint(
@@ -1244,8 +1240,6 @@ class ResearchExperimentRunner:
                     "metadata": {"query_id": qid},
                 })
 
-        print(f"  Using fresh contexts from optimized M1+M2")
-
         # Optimize
         adapter = GeneratorAdapter(
             generator_module=self.generator,
@@ -1262,9 +1256,8 @@ class ResearchExperimentRunner:
     async def phase_4_test_evaluation(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 4: Test set evaluation and ablation studies."""
         print(f"\n{'='*80}")
-        print(f"  PHASE 4: TEST SET EVALUATION & ABLATIONS")
+        print("  PHASE 4: TEST SET EVALUATION & ABLATIONS")
         print(f"{'='*80}")
-        print(f"  [IMPORTANT] Now evaluating on HELD-OUT test set")
 
         checkpoint = PhaseCheckpoint(
             phase=4,
@@ -1281,15 +1274,72 @@ class ResearchExperimentRunner:
 
         # Run ablation studies on TEST set
         ablations = await self.run_ablation_studies(prev_checkpoint)
-
-        # Store ablation results
         for ab in ablations:
             checkpoint.evaluations[f"ablation_{ab.config_name}"] = ab.to_dict()
 
-        # Generate all reports
+        # Generate reports
         self._generate_reports(checkpoint, ablations)
 
         self.save_checkpoint(4, checkpoint)
+        return checkpoint
+
+    # -------------------------------------------------------------------------
+    # Main Experiment Runner
+    # -------------------------------------------------------------------------
+
+    async def run_experiment(self, data_path: Path, resume_from: int = 0):
+        """
+        Run the complete experiment with iterative staged optimization.
+
+        Stages:
+        0. Data split & baseline capture
+        1. Query Planner optimization -> regenerate contexts
+        2. Reranker optimization (using optimized QP contexts) -> regenerate reranked
+        3. Generator optimization (using optimized QP+RR contexts)
+        4. Test set evaluation & ablation studies
+        """
+        print(f"\n{'='*80}")
+        print(f"  EXPERIMENT: {self.experiment_name}")
+        print(f"  ID: {self.experiment_id}")
+        print(f"  Resume from phase: {resume_from}")
+        print(f"{'='*80}")
+
+        # Load data and setup pipeline
+        await self.load_and_split_data(data_path)
+        await self.setup_pipeline()
+
+        # Try to resume from checkpoint
+        checkpoint = None
+        if resume_from > 0:
+            checkpoint = self.load_checkpoint(resume_from - 1)
+            if checkpoint:
+                self.restore_state_from_checkpoint(checkpoint)
+                print(f"  Resuming from Phase {resume_from}")
+            else:
+                print(f"  [WARNING] No checkpoint found for Phase {resume_from - 1}, starting from Phase 0")
+                resume_from = 0
+
+        # Execute phases
+        if resume_from <= 0:
+            checkpoint = await self.phase_0_baseline()
+
+        if resume_from <= 1:
+            checkpoint = await self.phase_1_query_planner(checkpoint or self.load_checkpoint(0))
+
+        if resume_from <= 2:
+            checkpoint = await self.phase_2_reranker(checkpoint or self.load_checkpoint(1))
+
+        if resume_from <= 3:
+            checkpoint = await self.phase_3_generator(checkpoint or self.load_checkpoint(2))
+
+        if resume_from <= 4:
+            checkpoint = await self.phase_4_test_evaluation(checkpoint or self.load_checkpoint(3))
+
+        print(f"\n{'='*80}")
+        print(f"  EXPERIMENT COMPLETE: {self.experiment_name}")
+        print(f"  Results saved to: {self.output_dir}")
+        print(f"{'='*80}")
+
         return checkpoint
 
     async def run_ablation_studies(self, checkpoint: PhaseCheckpoint) -> List[AblationResult]:
@@ -1297,8 +1347,6 @@ class ResearchExperimentRunner:
         print(f"\n  Running ablation studies on TEST set (n={len(self.test_queries)})...")
 
         ablations = []
-
-        # Load seed prompts from phase 0
         phase0 = self.load_checkpoint(0)
         seed_prompts = phase0.prompts if phase0 else {}
 
@@ -1321,29 +1369,22 @@ class ResearchExperimentRunner:
 
         for config_name, prompts in configs:
             print(f"\n    Ablation: {config_name}")
-
-            # Apply prompts
             self.query_planner._prompt = prompts.get("query_planner", "")
             self.reranker._prompt = prompts.get("reranker", "")
             self.generator._prompt = prompts.get("generator", "")
 
-            # Generate contexts for TEST set
             _, reranked = await self.generate_contexts_for_split(
                 self.test_queries, f"ablation_{config_name}"
             )
 
-            # Evaluate on TEST set
             eval_record = await self.evaluate_split(
                 self.test_queries, reranked, config_name, "test"
             )
 
             test_scores = eval_record.per_example_scores
-
             if config_name == "baseline":
                 baseline_scores = test_scores.copy()
-                self.baseline_test_scores = baseline_scores
 
-            # Compute significance vs baseline
             improvement = eval_record.mean_score - (statistics.mean(baseline_scores) if baseline_scores else 0)
             t_stat, p_value = paired_ttest(baseline_scores, test_scores) if baseline_scores else (0, 1)
 
@@ -1362,10 +1403,6 @@ class ResearchExperimentRunner:
             )
             ablations.append(ablation)
 
-            sig_marker = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else ""
-            print(f"      Score: {eval_record.mean_score:.4f} [{eval_record.ci_lower:.4f}, {eval_record.ci_upper:.4f}]")
-            print(f"      vs Baseline: {improvement:+.4f} (p={p_value:.4f}) {sig_marker}")
-
         # Restore final prompts
         self.query_planner._prompt = checkpoint.prompts.get("query_planner", "")
         self.reranker._prompt = checkpoint.prompts.get("reranker", "")
@@ -1382,7 +1419,7 @@ class ResearchExperimentRunner:
         """Generate all reports including LaTeX tables."""
         print(f"\n  Generating reports...")
 
-        # 1. Summary JSON
+        # Summary JSON
         summary = {
             "experiment_name": self.experiment_name,
             "experiment_id": self.experiment_id,
@@ -1401,13 +1438,9 @@ class ResearchExperimentRunner:
         with open(self.output_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2, default=str)
 
-        # 2. CSV Tables
+        # CSV and LaTeX Tables
         self._generate_csv_tables(checkpoint, ablations)
-
-        # 3. LaTeX Tables
         self._generate_latex_tables(checkpoint, ablations)
-
-        # 4. Per-example results
         self._save_per_example_results(ablations)
 
         print(f"  Reports saved to {self.output_dir}")
@@ -1425,7 +1458,7 @@ class ResearchExperimentRunner:
             for name in ["query_planner", "reranker", "generator"]:
                 if name in checkpoint.module_results:
                     r = checkpoint.module_results[name]
-            writer.writerow([
+                    writer.writerow([
                         name,
                         f"{r['baseline_score']:.4f}",
                         f"[{r['baseline_ci_lower']:.4f}, {r['baseline_ci_upper']:.4f}]",
@@ -1573,105 +1606,6 @@ class ResearchExperimentRunner:
                     "ci": [ab.test_ci_lower, ab.test_ci_upper],
                 }, f, indent=2)
 
-    # -------------------------------------------------------------------------
-    # Main Execution
-    # -------------------------------------------------------------------------
-
-    async def run_experiment(self, data_path: Path, resume_from: int = 0):
-        """Run complete experiment."""
-        experiment_start = datetime.now()
-
-        print("\n" + "=" * 80)
-        print("  RESEARCH PAPER QUALITY RAG OPTIMIZATION EXPERIMENT")
-        print("=" * 80)
-        print(f"\n  Experiment: {self.experiment_name}")
-        print(f"  ID: {self.experiment_id}")
-        print(f"  Config Hash: {self.config_hash[:16]}...")
-        print(f"  Random Seed: {self.random_seed}")
-        print(f"  Output: {self.output_dir}")
-
-        # Load and split data
-        await self.load_and_split_data(data_path)
-
-        # Setup pipeline
-        await self.setup_pipeline()
-
-        # Restore from checkpoint if resuming
-        checkpoint = None
-        if resume_from > 0:
-            checkpoint = self.load_checkpoint(resume_from - 1)
-            if checkpoint:
-                self.restore_state_from_checkpoint(checkpoint)
-            else:
-                print(f"  [WARNING] No checkpoint found, starting from Phase 0")
-                resume_from = 0
-
-        # Execute phases
-        try:
-            if resume_from <= 0:
-                checkpoint = await self.phase_0_baseline()
-
-            if resume_from <= 1:
-                if checkpoint is None:
-                    checkpoint = self.load_checkpoint(0)
-                checkpoint = await self.phase_1_query_planner(checkpoint)
-
-            if resume_from <= 2:
-                if checkpoint is None:
-                    checkpoint = self.load_checkpoint(1)
-                    self.restore_state_from_checkpoint(checkpoint)
-                checkpoint = await self.phase_2_reranker(checkpoint)
-
-            if resume_from <= 3:
-                if checkpoint is None:
-                    checkpoint = self.load_checkpoint(2)
-                    self.restore_state_from_checkpoint(checkpoint)
-                checkpoint = await self.phase_3_generator(checkpoint)
-
-            if resume_from <= 4:
-                if checkpoint is None:
-                    checkpoint = self.load_checkpoint(3)
-                    self.restore_state_from_checkpoint(checkpoint)
-                checkpoint = await self.phase_4_test_evaluation(checkpoint)
-
-        except Exception as e:
-            print(f"\n  [ERROR] Experiment failed: {e}")
-            import traceback
-            traceback.print_exc()
-            print(f"\n  Resume with: --resume_from <phase>")
-            raise
-
-        # Print final summary
-        experiment_end = datetime.now()
-        duration = (experiment_end - experiment_start).total_seconds()
-
-        print(f"\n{'='*80}")
-        print("  EXPERIMENT COMPLETE")
-        print(f"{'='*80}")
-
-        if self.ablation_results:
-            baseline = self.ablation_results[0]
-            best = self.ablation_results[-1]
-
-            print(f"\n  Test Set Results (Held-Out, n={len(self.test_queries)}):")
-            print(f"    Baseline:  {baseline.test_score:.4f} [{baseline.test_ci_lower:.4f}, {baseline.test_ci_upper:.4f}]")
-            print(f"    Optimized: {best.test_score:.4f} [{best.test_ci_lower:.4f}, {best.test_ci_upper:.4f}]")
-
-            sig = "***" if best.p_value < 0.001 else "**" if best.p_value < 0.01 else "*" if best.p_value < 0.05 else ""
-            print(f"    Improvement: {best.improvement_vs_baseline:+.4f} (p={best.p_value:.4f}) {sig}")
-
-            print(f"\n  Ablation Study:")
-            for ab in self.ablation_results:
-                sig = "***" if ab.p_value < 0.001 else "**" if ab.p_value < 0.01 else "*" if ab.p_value < 0.05 else ""
-                print(f"    {ab.config_name:12s}: {ab.test_score:.4f} (Δ={ab.improvement_vs_baseline:+.4f}) {sig}")
-
-        print(f"\n  Duration: {duration:.1f}s ({duration/60:.1f} min)")
-        print(f"  Output: {self.output_dir}")
-        print(f"\n  Generated Files:")
-        print(f"    - summary.json (complete results)")
-        print(f"    - latex/*.tex (paper-ready tables)")
-        print(f"    - analysis/*.csv (detailed metrics)")
-        print(f"    - per_example/*.json (per-query scores)")
 
 
 # =============================================================================
@@ -1710,10 +1644,10 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Research Paper Quality RAG Pipeline Optimization"
+        description="Research Paper Quality RAG Pipeline Optimization V2"
     )
 
-    parser.add_argument("--experiment_name", type=str, default="paper_exp_001")
+    parser.add_argument("--experiment_name", type=str, default="paper_exp_002")
     parser.add_argument("--output_dir", type=str, default="experiments")
     parser.add_argument("--data_path", type=str, default="data/train")
     parser.add_argument("--resume_from", type=int, default=0)
@@ -1731,8 +1665,7 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_overlap", type=int, default=50)
     parser.add_argument("--retrieval_k", type=int, default=20)
     parser.add_argument("--rerank_k", type=int, default=10)
-    parser.add_argument("--max_concurrent", type=int, default=10,
-                        help="Max concurrent API calls (default: 10)")
+    parser.add_argument("--max_concurrent", type=int, default=10)
 
     args = parser.parse_args()
     asyncio.run(main(args))

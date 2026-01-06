@@ -6,7 +6,7 @@ Each module has its own set of target metrics.
 
 Module 1 (Query Planner + Retrieval): context_precision, context_recall (LLM-based)
 Module 2 (Reranker): rerank_precision, rerank_recall, improvement metrics (compares vs pre-rerank)
-Module 3 (Generator): faithfulness, answer_correctness
+Module 3 (Generator): faithfulness, answer_accuracy
 """
 
 import os
@@ -21,8 +21,7 @@ from ragas.metrics import (
     LLMContextPrecisionWithReference,
     LLMContextRecall,
     Faithfulness,
-    AnswerCorrectness,  # More comprehensive - factual accuracy + semantic similarity
-    AnswerSimilarity,   # Required for AnswerCorrectness
+    AnswerAccuracy,
     IDBasedContextPrecision,
     IDBasedContextRecall,
 )
@@ -51,7 +50,7 @@ class RAGASEvaluator(ModuleEvaluator):
     - Query Planner + Retrieval: context_precision, context_recall (measures retrieval quality)
     - Reranker: rerank_precision, rerank_recall, precision_improvement, recall_improvement
                 (measures post-rerank quality AND improvement over pre-rerank)
-    - Generator: faithfulness, answer_correctness
+    - Generator: faithfulness, answer_accuracy
     """
 
     def __init__(self, model: str = "gpt-4o-mini"):
@@ -70,11 +69,11 @@ class RAGASEvaluator(ModuleEvaluator):
         self.evaluator_llm = LangchainLLMWrapper(chat_llm)
 
         # Initialize embeddings for AnswerSimilarity (used by AnswerCorrectness)
-        langchain_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.evaluator_embeddings = LangchainEmbeddingsWrapper(langchain_embeddings)
+        # langchain_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        # self.evaluator_embeddings = LangchainEmbeddingsWrapper(langchain_embeddings)
 
         # Initialize AnswerSimilarity with embeddings (required for AnswerCorrectness)
-        answer_similarity = AnswerSimilarity(embeddings=self.evaluator_embeddings)
+        # answer_similarity = AnswerSimilarity(embeddings=self.evaluator_embeddings)
 
         # Initialize metrics
         self.metrics = {
@@ -86,11 +85,7 @@ class RAGASEvaluator(ModuleEvaluator):
             'context_precision': LLMContextPrecisionWithReference(llm=self.evaluator_llm),
             'context_recall': LLMContextRecall(llm=self.evaluator_llm),
             'faithfulness': Faithfulness(llm=self.evaluator_llm),
-            # AnswerCorrectness = factual accuracy + semantic similarity (more comprehensive)
-            'answer_correctness': AnswerCorrectness(
-                llm=self.evaluator_llm,
-                answer_similarity=answer_similarity,
-            ),
+            'answer_accuracy': AnswerAccuracy(llm=self.evaluator_llm)
         }
 
     async def _call_metric(
@@ -142,6 +137,93 @@ class RAGASEvaluator(ModuleEvaluator):
         # Log final failure
         print(f"[RAGAS] {metric_name} failed after {max_retries} retries: {str(last_exception)[:100]}")
         return 0.0
+
+    def _compute_rank_metrics(
+        self,
+        ranked_indices: List[int],
+        relevant_set: set,
+        prefix: str = '',
+        k_values: List[int] = [5, 10, 20],
+    ) -> Dict[str, float]:
+        """
+        Compute order-aware ranking metrics (DETERMINISTIC).
+
+        These metrics reward relevant documents appearing at higher positions.
+
+        Args:
+            ranked_indices: List of chunk indices in ranked order
+            relevant_set: Set of ground truth relevant chunk indices
+            prefix: Prefix for metric names (e.g., 'rerank_', 'pre_rerank_')
+            k_values: K values for Precision@K and NDCG@K
+
+        Returns:
+            Dict with:
+                - {prefix}ndcg: Normalized Discounted Cumulative Gain
+                - {prefix}mrr: Mean Reciprocal Rank
+                - {prefix}precision_at_K: Precision at top K for each K
+                - {prefix}recall_at_K: Recall at top K for each K
+                - {prefix}hits_at_K: Number of relevant docs in top K
+        """
+        import math
+
+        scores = {}
+
+        if not ranked_indices or not relevant_set:
+            # Return zeros for all metrics
+            scores[f'{prefix}ndcg'] = 0.0
+            scores[f'{prefix}mrr'] = 0.0
+            for k in k_values:
+                scores[f'{prefix}precision_at_{k}'] = 0.0
+                scores[f'{prefix}recall_at_{k}'] = 0.0
+                scores[f'{prefix}hits_at_{k}'] = 0
+            return scores
+
+        # 1. MRR (Mean Reciprocal Rank) - position of first relevant doc
+        mrr = 0.0
+        for i, idx in enumerate(ranked_indices):
+            if idx in relevant_set:
+                mrr = 1.0 / (i + 1)
+                break
+        scores[f'{prefix}mrr'] = mrr
+
+        # 2. NDCG (Normalized Discounted Cumulative Gain)
+        # DCG = sum of (rel_i / log2(i + 2)) for i in positions
+        # IDCG = DCG with perfect ranking (all relevant docs first)
+        dcg = 0.0
+        for i, idx in enumerate(ranked_indices):
+            if idx in relevant_set:
+                # rel_i = 1 for binary relevance
+                dcg += 1.0 / math.log2(i + 2)  # +2 because log2(1) = 0
+
+        # IDCG: ideal ranking has all relevant docs at top positions
+        num_relevant = min(len(relevant_set), len(ranked_indices))
+        idcg = sum(1.0 / math.log2(i + 2) for i in range(num_relevant))
+
+        ndcg = dcg / idcg if idcg > 0 else 0.0
+        scores[f'{prefix}ndcg'] = ndcg
+
+        # 3. Precision@K, Recall@K, Hits@K
+        for k in k_values:
+            top_k = ranked_indices[:k]
+            hits = sum(1 for idx in top_k if idx in relevant_set)
+
+            precision_at_k = hits / k if k > 0 else 0.0
+            recall_at_k = hits / len(relevant_set) if relevant_set else 0.0
+
+            scores[f'{prefix}precision_at_{k}'] = precision_at_k
+            scores[f'{prefix}recall_at_{k}'] = recall_at_k
+            scores[f'{prefix}hits_at_{k}'] = hits
+
+        # 4. Overall precision and recall (for compatibility)
+        total_hits = sum(1 for idx in ranked_indices if idx in relevant_set)
+        scores[f'{prefix}precision'] = total_hits / len(ranked_indices) if ranked_indices else 0.0
+        scores[f'{prefix}recall'] = total_hits / len(relevant_set) if relevant_set else 0.0
+
+        # F1 score
+        p, r = scores[f'{prefix}precision'], scores[f'{prefix}recall']
+        scores[f'{prefix}f1'] = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+        return scores
 
     async def evaluate(
         self,
@@ -309,45 +391,79 @@ class RAGASEvaluator(ModuleEvaluator):
         ground_truth: Optional[Dict[str, Any]] = None
     ) -> Dict[str, float]:
         """
-        Evaluate reranker output using LLM-based context metrics.
-        
-        Measures both absolute quality AND improvement over pre-rerank results.
+        Evaluate reranker output using deterministic ID-based metrics (primary) with LLM fallback.
+
+        ORDER MATTERS for reranking - uses rank-aware metrics like NDCG, MRR, Precision@K.
+
+        Evaluation modes (in priority order):
+        1. ID-based (PRIMARY): Compare reranked chunk_indices to relevant_chunk_indices
+           - NDCG: Rewards relevant docs at higher positions
+           - MRR: Position of first relevant doc
+           - Precision@K: Precision at top K positions
+        2. LLM-based (FALLBACK): When only reference answer available
 
         Args:
             ground_truth: Dict with:
+                - 'relevant_chunk_indices' (List[int]): Ground truth relevant chunk IDs (preferred)
+                - 'pre_rerank_chunk_indices' (List[int]): Chunk IDs before reranking
                 - 'query' (str): The original query
-                - 'reference' (str): Ground truth answer
-                - 'pre_rerank_documents' (List[str], optional): Documents before reranking
-                - 'pre_rerank_precision' (float, optional): Pre-computed precision before rerank
-                - 'pre_rerank_recall' (float, optional): Pre-computed recall before rerank
+                - 'reference' (str): Ground truth answer (for LLM fallback)
         """
         scores = {}
 
         if not ground_truth:
             return scores
 
+        # Mode 1: Deterministic ID-based evaluation (PRIMARY - order-aware)
+        relevant_chunk_indices = ground_truth.get('relevant_chunk_indices', [])
+        reranked_chunk_indices = getattr(output_data, 'chunk_indices', [])
+        pre_rerank_chunk_indices = ground_truth.get('pre_rerank_chunk_indices', [])
+
+        if relevant_chunk_indices and reranked_chunk_indices:
+            relevant_set = set(relevant_chunk_indices)
+
+            # Calculate order-aware metrics for reranked results
+            rerank_metrics = self._compute_rank_metrics(
+                reranked_chunk_indices, relevant_set, prefix='rerank_'
+            )
+            scores.update(rerank_metrics)
+
+            # Calculate improvement over pre-rerank ordering
+            if pre_rerank_chunk_indices:
+                pre_metrics = self._compute_rank_metrics(
+                    pre_rerank_chunk_indices, relevant_set, prefix='pre_rerank_'
+                )
+                scores.update(pre_metrics)
+
+                # Compute improvements
+                scores['ndcg_improvement'] = scores['rerank_ndcg'] - scores.get('pre_rerank_ndcg', 0)
+                scores['mrr_improvement'] = scores['rerank_mrr'] - scores.get('pre_rerank_mrr', 0)
+                scores['precision_at_5_improvement'] = (
+                    scores['rerank_precision_at_5'] - scores.get('pre_rerank_precision_at_5', 0)
+                )
+
+            # Return early with deterministic scores (skip LLM)
+            return scores
+
+        # Mode 2: LLM-based evaluation (FALLBACK - when IDs not available)
         query = ground_truth.get('query', '')
         reference = ground_truth.get('reference', '')
 
         if not query or not reference:
             return scores
-        
-        # Ensure reference is a string (not float or other type)
+
         reference = str(reference) if reference else ""
         query = str(query) if query else ""
-        
-        # Get ranked documents and ensure it's a list of strings
+
         ranked_docs = getattr(output_data, 'ranked_documents', [])
         if not ranked_docs:
-            return {'context_precision': 0.0, 'context_recall': 0.0, 'context_f1': 0.0}
-        
-        # Convert all docs to strings and filter empty
+            return {'rerank_precision': 0.0, 'rerank_recall': 0.0, 'rerank_f1': 0.0}
+
         ranked_docs = [str(doc) for doc in ranked_docs if doc]
         if not ranked_docs:
-            return {'context_precision': 0.0, 'context_recall': 0.0, 'context_f1': 0.0}
+            return {'rerank_precision': 0.0, 'rerank_recall': 0.0, 'rerank_f1': 0.0}
 
         try:
-            # Evaluate context precision after reranking (with retry)
             scores['rerank_precision'] = await self._call_metric(
                 'context_precision',
                 user_input=str(query),
@@ -355,7 +471,6 @@ class RAGASEvaluator(ModuleEvaluator):
                 reference=str(reference)
             )
 
-            # Evaluate context recall after reranking (with retry)
             scores['rerank_recall'] = await self._call_metric(
                 'context_recall',
                 user_input=str(query),
@@ -363,7 +478,6 @@ class RAGASEvaluator(ModuleEvaluator):
                 reference=str(reference)
             )
 
-            # Calculate F1
             if scores['rerank_precision'] + scores['rerank_recall'] > 0:
                 scores['rerank_f1'] = 2 * (
                     scores['rerank_precision'] * scores['rerank_recall']
@@ -375,7 +489,6 @@ class RAGASEvaluator(ModuleEvaluator):
             pre_precision = ground_truth.get('pre_rerank_precision')
             pre_recall = ground_truth.get('pre_rerank_recall')
 
-            # If pre-rerank documents provided but not scores, compute them
             pre_rerank_docs = ground_truth.get('pre_rerank_documents')
             if pre_rerank_docs and pre_precision is None:
                 pre_docs = [str(d) for d in pre_rerank_docs if d]
@@ -397,7 +510,6 @@ class RAGASEvaluator(ModuleEvaluator):
                         reference=str(reference)
                     )
 
-            # Calculate improvement metrics
             if pre_precision is not None:
                 scores['pre_rerank_precision'] = float(pre_precision)
                 scores['precision_improvement'] = scores['rerank_precision'] - scores['pre_rerank_precision']
@@ -439,12 +551,12 @@ class RAGASEvaluator(ModuleEvaluator):
         ground_truth: Optional[Dict[str, Any]] = None
     ) -> Dict[str, float]:
         """
-        Evaluate generator output using faithfulness and answer_correctness.
+        Evaluate generator output using faithfulness and answer_accuracy.
 
         Args:
             ground_truth: Dict with 'query', 'contexts', 'reference' (ground truth answer)
         """
-        scores = {'faithfulness': 0.0, 'answer_correctness': 0.0, 'generation_quality': 0.0}
+        scores = {'faithfulness': 0.0, 'answer_accuracy': 0.0, 'generation_quality': 0.0}
 
         if not ground_truth:
             return scores
@@ -476,10 +588,9 @@ class RAGASEvaluator(ModuleEvaluator):
             retrieved_contexts=[str(c) for c in contexts]
         )
 
-        # Answer Correctness: Does the answer match ground truth? (with retry)
         if reference:
-            scores['answer_correctness'] = await self._call_metric(
-                'answer_correctness',
+            scores['answer_accuracy'] = await self._call_metric(
+                'answer_accuracy',
                 user_input=str(query),
                 response=str(answer),
                 reference=str(reference)
@@ -487,7 +598,7 @@ class RAGASEvaluator(ModuleEvaluator):
 
         # Calculate generation quality
         scores['generation_quality'] = (
-            scores.get('faithfulness', 0) + scores.get('answer_correctness', 0)
+            scores.get('faithfulness', 0) + scores.get('answer_accuracy', 0)
         ) / 2
 
         return scores
@@ -650,15 +761,15 @@ class RAGASEvaluator(ModuleEvaluator):
             ))
             metric_names.append('faithfulness')
 
-        # Answer correctness (requires ground_truth)
+        # Answer accuracy (requires ground_truth)
         if ground_truth:
             metric_tasks.append(self._call_metric(
-                'answer_correctness',
+                'answer_accuracy',
                 user_input=query,
                 response=answer,
                 reference=ground_truth,
             ))
-            metric_names.append('answer_correctness')
+            metric_names.append('answer_accuracy')
 
         # Run all metrics in PARALLEL
         if metric_tasks:
@@ -674,7 +785,7 @@ class RAGASEvaluator(ModuleEvaluator):
         scores.setdefault('context_precision', 0.0)
         scores.setdefault('context_recall', 0.0)
         scores.setdefault('faithfulness', 0.0)
-        scores.setdefault('answer_correctness', 0.0)
+        scores.setdefault('answer_accuracy', 0.0)
 
         # Calculate aggregate scores
         if 'retrieval_precision' in scores and 'retrieval_recall' in scores:
@@ -685,7 +796,7 @@ class RAGASEvaluator(ModuleEvaluator):
         scores['context_f1'] = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
         scores['generation_quality'] = (
-            scores['faithfulness'] + scores['answer_correctness']
+            scores['faithfulness'] + scores['answer_accuracy']
         ) / 2
 
         # Overall quality (weighted)

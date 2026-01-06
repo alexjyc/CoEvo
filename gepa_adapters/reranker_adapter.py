@@ -74,16 +74,19 @@ class RerankerAdapter(RAGModuleAdapter):
         Process:
         1. Take pre-retrieved documents from data["contexts"]
         2. Run reranker to reorder documents
-        3. Return reranked documents for evaluation
+        3. Return reranked documents with chunk indices for evaluation
 
         Args:
-            data: RAGDataInst with query, contexts (pre-retrieved docs)
+            data: RAGDataInst with query, contexts (pre-retrieved docs),
+                  and optionally context_chunk_indices (for deterministic eval)
 
         Returns:
             Tuple of (output, module_input, module_output)
         """
         query = data["query"]
         documents = data.get("contexts", [])
+        # Get chunk indices for deterministic evaluation
+        pre_rerank_chunk_indices = data.get("context_chunk_indices", [])
 
         if not documents:
             return {
@@ -102,12 +105,31 @@ class RerankerAdapter(RAGModuleAdapter):
         # Package output
         ranked_docs = reranker_output.ranked_documents[:self.top_k]
 
+        # Map reranked documents to their chunk indices
+        # Build doc -> index mapping from original order
+        reranked_chunk_indices = []
+        if pre_rerank_chunk_indices:
+            doc_to_idx = {}
+            for i, (doc, idx) in enumerate(zip(documents, pre_rerank_chunk_indices)):
+                # Use first 200 chars as key to handle duplicates
+                doc_key = doc[:200] if doc else ""
+                if doc_key not in doc_to_idx:
+                    doc_to_idx[doc_key] = idx
+
+            for doc in ranked_docs:
+                doc_key = doc[:200] if doc else ""
+                if doc_key in doc_to_idx:
+                    reranked_chunk_indices.append(doc_to_idx[doc_key])
+                else:
+                    reranked_chunk_indices.append(-1)  # Unknown index
+
         output: RAGRolloutOutput = {
             "result": {
                 "ranked_documents": ranked_docs,
                 "scores": reranker_output.scores[:self.top_k],
                 "num_input": len(documents),
                 "num_output": len(ranked_docs),
+                "reranked_chunk_indices": reranked_chunk_indices,
             },
             "success": reranker_output.status == "success",
             "error": reranker_output.error_message,
@@ -117,12 +139,15 @@ class RerankerAdapter(RAGModuleAdapter):
             "query": query,
             "documents": documents,
             "num_documents": len(documents),
+            "pre_rerank_chunk_indices": pre_rerank_chunk_indices,
         }
 
         module_output = {
             "ranked_documents": ranked_docs,
             "scores": reranker_output.scores[:self.top_k],
             "original_order": documents,
+            "reranked_chunk_indices": reranked_chunk_indices,
+            "pre_rerank_chunk_indices": pre_rerank_chunk_indices,
         }
 
         return output, module_input, module_output
@@ -133,15 +158,14 @@ class RerankerAdapter(RAGModuleAdapter):
         module_output: Dict[str, Any],
     ) -> Tuple[float, Dict[str, float]]:
         """
-        Compute reranking quality score.
+        Compute reranking quality score using DETERMINISTIC ID-based metrics.
 
-        Evaluates improvement in ranking quality:
-        - How many relevant docs moved to top positions
-        - Improvement over original ordering
+        Uses order-aware metrics (NDCG, MRR, Precision@K) when chunk indices available.
+        Falls back to LLM-based evaluation only when IDs not available.
 
         Args:
-            data: Original input with ground_truth
-            module_output: Reranker output with ranked_documents
+            data: Original input with ground_truth and relevant_chunk_indices
+            module_output: Reranker output with ranked_documents and chunk_indices
 
         Returns:
             Tuple of (score, detailed_metrics)
@@ -151,86 +175,71 @@ class RerankerAdapter(RAGModuleAdapter):
         ground_truth = data.get("ground_truth", "")
         query = data["query"]
 
-        # Use LLM-based evaluation for reranking quality
-        reranker_eval = await self.evaluator._evaluate_reranker(
-            input_data=RerankerInput(query=query, documents=original_order),
-            output_data=type('obj', (object,), {'ranked_documents': ranked_docs})(),
-            ground_truth={"query": query, "reference": ground_truth} if ground_truth else None
-        )
+        # Get chunk indices for deterministic evaluation
+        reranked_chunk_indices = module_output.get("reranked_chunk_indices", [])
+        pre_rerank_chunk_indices = module_output.get("pre_rerank_chunk_indices", [])
+        relevant_chunk_indices = data.get("relevant_chunk_indices", [])
 
-        # Note: _evaluate_reranker returns rerank_precision/rerank_recall (not context_*)
-        precision = reranker_eval.get("rerank_precision", 0.0)
-        recall = reranker_eval.get("rerank_recall", 0.0)
-        f1 = reranker_eval.get("rerank_f1", 0.0)
-
-        # Calculate if F1 not provided
-        if f1 == 0.0 and (precision > 0 or recall > 0):
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-        # Calculate position improvement (how much did relevant docs move up)
-        position_improvement = self._calculate_position_improvement(
-            original_order, ranked_docs, ground_truth
-        )
-
-        metrics = {
-            "context_precision": precision,
-            "context_recall": recall,
-            "f1": f1,
-            "position_improvement": position_improvement,
-            "num_input": len(original_order),
-            "num_output": len(ranked_docs),
+        # Build ground truth dict for evaluator
+        gt_dict = {
+            "query": query,
+            "reference": ground_truth,
+            "relevant_chunk_indices": relevant_chunk_indices,
+            "pre_rerank_chunk_indices": pre_rerank_chunk_indices,
         }
 
-        # Combined score: F1 weighted with position improvement bonus
-        score = f1 * 0.8 + position_improvement * 0.2
+        # Create output object with chunk_indices for deterministic eval
+        class RerankerOutputWithIndices:
+            def __init__(self, docs, indices):
+                self.ranked_documents = docs
+                self.chunk_indices = indices
+
+        reranker_eval = await self.evaluator._evaluate_reranker(
+            input_data=RerankerInput(query=query, documents=original_order),
+            output_data=RerankerOutputWithIndices(ranked_docs, reranked_chunk_indices),
+            ground_truth=gt_dict if (relevant_chunk_indices or ground_truth) else None
+        )
+
+        # Use NDCG as primary score (order-aware, deterministic)
+        # Falls back to F1 if NDCG not available (LLM-based fallback was used)
+        ndcg = reranker_eval.get("rerank_ndcg", 0.0)
+        mrr = reranker_eval.get("rerank_mrr", 0.0)
+        precision_at_5 = reranker_eval.get("rerank_precision_at_5", 0.0)
+        precision_at_10 = reranker_eval.get("rerank_precision_at_10", 0.0)
+
+        # Fallback to LLM-based metrics if deterministic not available
+        if ndcg == 0.0 and "rerank_precision" in reranker_eval:
+            precision = reranker_eval.get("rerank_precision", 0.0)
+            recall = reranker_eval.get("rerank_recall", 0.0)
+            f1 = reranker_eval.get("rerank_f1", 0.0)
+            if f1 == 0.0 and (precision > 0 or recall > 0):
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+            score = f1
+        else:
+            # Use deterministic metrics (preferred)
+            # Combined score: NDCG (60%) + MRR (20%) + Precision@5 (20%)
+            score = ndcg * 0.6 + mrr * 0.2 + precision_at_5 * 0.2
+
+        # Build metrics dict
+        metrics = {
+            "ndcg": ndcg,
+            "mrr": mrr,
+            "precision_at_5": precision_at_5,
+            "precision_at_10": precision_at_10,
+            "ndcg_improvement": reranker_eval.get("ndcg_improvement", 0.0),
+            "mrr_improvement": reranker_eval.get("mrr_improvement", 0.0),
+            "num_input": len(original_order),
+            "num_output": len(ranked_docs),
+            "has_chunk_indices": bool(reranked_chunk_indices),
+        }
+
+        # Add fallback LLM metrics if used
+        if "rerank_precision" in reranker_eval:
+            metrics["llm_precision"] = reranker_eval.get("rerank_precision", 0.0)
+            metrics["llm_recall"] = reranker_eval.get("rerank_recall", 0.0)
+            metrics["llm_f1"] = reranker_eval.get("rerank_f1", 0.0)
 
         return score, metrics
-
-    def _calculate_position_improvement(
-        self,
-        original: List[str],
-        reranked: List[str],
-        ground_truth: str,
-    ) -> float:
-        """
-        Calculate how much relevant documents improved in position.
-
-        Returns a score from 0-1 where:
-        - 1.0 = all relevant docs moved to top
-        - 0.0 = no improvement or degradation
-        """
-        if not ground_truth or not original or not reranked:
-            return 0.5
-
-        # Find documents containing ground truth content
-        gt_lower = ground_truth.lower()
-        relevant_original_positions = []
-        relevant_reranked_positions = []
-
-        for i, doc in enumerate(original):
-            if any(term in doc.lower() for term in gt_lower.split()[:5]):
-                relevant_original_positions.append(i)
-
-        for i, doc in enumerate(reranked):
-            if any(term in doc.lower() for term in gt_lower.split()[:5]):
-                relevant_reranked_positions.append(i)
-
-        if not relevant_original_positions or not relevant_reranked_positions:
-            return 0.5
-
-        # Calculate average position improvement
-        avg_original = sum(relevant_original_positions) / len(relevant_original_positions)
-        avg_reranked = sum(relevant_reranked_positions) / len(relevant_reranked_positions)
-
-        # Normalize: improvement from moving to top (position 0)
-        max_improvement = avg_original
-        actual_improvement = avg_original - avg_reranked
-
-        if max_improvement <= 0:
-            return 0.5
-
-        improvement_ratio = max(0, min(1, actual_improvement / max_improvement))
-        return improvement_ratio
 
     def _format_trace_for_reflection(
         self,
