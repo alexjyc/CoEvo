@@ -483,6 +483,10 @@ class RAGModuleAdapter(_BaseClass):
 # Convenience Function: Run GEPA Optimization Directly
 # =============================================================================
 
+# Minimum recommended budget for effective GEPA optimization
+MIN_RECOMMENDED_BUDGET = 100
+
+
 def optimize_prompt(
     adapter: RAGModuleAdapter,
     trainset: List[RAGDataInst],
@@ -503,6 +507,7 @@ def optimize_prompt(
         trainset: Training data instances
         valset: Optional validation data instances
         max_metric_calls: Maximum number of evaluations (optimization budget)
+                         RECOMMENDED: 100-200 for meaningful optimization
         reflection_lm: Model for GEPA's reflective mutation
         seed_prompt: Optional seed prompt (uses module's current prompt if not provided)
         **kwargs: Additional arguments passed to gepa.optimize()
@@ -521,16 +526,27 @@ def optimize_prompt(
             adapter=adapter,
             trainset=training_data,
             valset=validation_data,
-            max_metric_calls=50,
+            max_metric_calls=100,  # Recommended: 100-200
         )
         print(f"Best prompt score: {result['best_score']}")
         planner_module.prompt = result['best_prompt']
+
+    Note:
+        Budget < 100 may not provide enough iterations for meaningful
+        prompt evolution. GEPA needs sufficient rollouts to explore
+        the prompt space and find improvements.
     """
     if not GEPA_AVAILABLE:
         raise ImportError(
             "GEPA not installed. Install with: pip install gepa-ai\n"
             "See https://github.com/gepa-ai/gepa for documentation."
         )
+
+    # Budget warning
+    if max_metric_calls < MIN_RECOMMENDED_BUDGET:
+        print(f"\n⚠️  WARNING: Budget ({max_metric_calls}) is below recommended minimum ({MIN_RECOMMENDED_BUDGET}).")
+        print(f"   GEPA may not have enough iterations to find improvements.")
+        print(f"   Consider increasing to 100-200 for better results.\n")
 
     import gepa
 

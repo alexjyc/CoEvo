@@ -9,9 +9,15 @@ Module I/O:
 
 Target Metrics: context_precision, context_recall (post-rerank improvement)
 Optimization Goal: Surface relevant documents to top positions
+
+GEPA Optimization Notes:
+- Reflective feedback includes ground truth context for better prompt evolution
+- Shows what documents should have been ranked higher
+- Provides contrastive examples for ranking criteria
 """
 
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 from gepa_adapters.base import (
     RAGModuleAdapter,
@@ -246,10 +252,15 @@ class RerankerAdapter(RAGModuleAdapter):
         trajectory: RAGTrajectory,
     ) -> Dict[str, Any]:
         """
-        Format trajectory into GEPA reflection record.
+        Format trajectory into GEPA reflection record with rich feedback.
+
+        GEPA Best Practices Applied:
+        1. Include ground truth answer so reflection LLM knows what to prioritize
+        2. Show which documents should have been ranked higher
+        3. Provide specific, actionable ranking criteria
 
         Returns:
-            Dict with Inputs, Generated Outputs, Feedback keys
+            Dict with Inputs, Generated Outputs, Expected Answer, Feedback keys
         """
         data = trajectory["data"]
         module_input = trajectory["module_input"]
@@ -257,13 +268,15 @@ class RerankerAdapter(RAGModuleAdapter):
         score = trajectory["score"]
         metrics = trajectory["metrics"]
 
-        # Format inputs
+        # Extract key information
         query = module_input.get("query", data["query"])
         docs = module_input.get("documents", [])
+        ground_truth = data.get("ground_truth", "")
 
+        # Format inputs
         inputs_text = f"Query: {query}\n\nDocuments to rerank ({len(docs)} total):\n"
         for i, doc in enumerate(docs[:5], 1):  # Show first 5
-            doc_preview = doc[:100] + "..." if len(doc) > 100 else doc
+            doc_preview = doc[:150] + "..." if len(doc) > 150 else doc
             inputs_text += f"  [{i}] {doc_preview}\n"
         if len(docs) > 5:
             inputs_text += f"  ... and {len(docs) - 5} more\n"
@@ -272,61 +285,71 @@ class RerankerAdapter(RAGModuleAdapter):
         ranked = module_output.get("ranked_documents", [])
         outputs_text = f"Reranked order (top {len(ranked)}):\n"
         for i, doc in enumerate(ranked[:5], 1):
-            doc_preview = doc[:100] + "..." if len(doc) > 100 else doc
+            doc_preview = doc[:150] + "..." if len(doc) > 150 else doc
             outputs_text += f"  [{i}] {doc_preview}\n"
 
-        # Generate feedback
-        feedback = self._generate_feedback(score, metrics)
+        # Format expected answer (for context)
+        if ground_truth:
+            gt_preview = ground_truth[:300] + "..." if len(ground_truth) > 300 else ground_truth
+            expected_text = f"Expected Answer: {gt_preview}"
+        else:
+            expected_text = "Expected Answer: Not available"
+
+        # Generate rich feedback with ground truth context
+        feedback = self._generate_rich_feedback(score, metrics, ground_truth, docs, ranked)
 
         return {
             "Inputs": inputs_text,
             "Generated Outputs": outputs_text,
+            "Expected Answer": expected_text,
             "Feedback": feedback,
-            "Score": score,
-            "Metrics": metrics,
+            "Score": f"{score:.3f}",
         }
+
+    def _generate_rich_feedback(
+        self,
+        score: float,
+        metrics: Dict[str, float],
+        ground_truth: str,
+        original_docs: List[str],
+        ranked_docs: List[str],
+    ) -> str:
+        """Generate rich feedback with contrastive examples for reranking."""
+        ndcg = metrics.get("ndcg", 0)
+        mrr = metrics.get("mrr", 0)
+        precision_at_5 = metrics.get("precision_at_5", 0)
+
+        # Determine performance tier (adaptive thresholds)
+        if score >= 0.5:
+            feedback = f"GOOD: Score={score:.2f}. "
+            feedback += f"NDCG={ndcg:.2f}, MRR={mrr:.2f}. "
+            feedback += "Ranking effectively prioritized relevant documents. "
+            if ground_truth:
+                feedback += f"Documents containing '{ground_truth[:100]}...' ranked appropriately."
+        elif score >= 0.2:
+            feedback = f"PARTIAL: Score={score:.2f}. "
+            feedback += f"NDCG={ndcg:.2f}, Precision@5={precision_at_5:.1%}. "
+            if mrr < 0.5:
+                feedback += "First relevant document not in top positions. "
+            if ground_truth:
+                feedback += f"PRIORITIZE documents mentioning: '{ground_truth[:150]}...'. "
+            feedback += "TRY: Weight documents with direct answers higher than context."
+        else:
+            feedback = f"POOR: Score={score:.2f}. "
+            feedback += "Ranking failed to surface relevant documents. "
+            if ground_truth:
+                feedback += f"MUST PRIORITIZE content about: '{ground_truth[:150]}...'. "
+            feedback += "CRITERIA: (1) Contains answer, (2) Addresses query directly, (3) Has supporting facts."
+
+        return feedback
 
     def _positive_feedback(self, score: float, metrics: Dict[str, float]) -> str:
         """Generate positive feedback for effective reranking"""
-        precision = metrics.get("context_precision", 0)
-        position_improvement = metrics.get("position_improvement", 0)
-
-        feedback = f"Effective reranking (score={score:.2f}). "
-        feedback += f"Achieved {precision:.0%} precision in top documents. "
-
-        if position_improvement > 0.5:
-            feedback += "Successfully moved relevant documents to top positions. "
-        elif position_improvement > 0:
-            feedback += "Moderate improvement in document ordering. "
-
-        feedback += "The ranking criteria correctly prioritized relevant content."
-
-        return feedback
+        return self._generate_rich_feedback(score, metrics, "", [], [])
 
     def _negative_feedback(self, score: float, metrics: Dict[str, float]) -> str:
         """Generate improvement suggestions for ineffective reranking"""
-        precision = metrics.get("context_precision", 0)
-        recall = metrics.get("context_recall", 0)
-        position_improvement = metrics.get("position_improvement", 0)
-
-        feedback = f"Reranking needs improvement (score={score:.2f}). "
-
-        if precision < 0.5:
-            feedback += "Low precision: irrelevant documents ranked too high. "
-            feedback += "Focus on content that directly answers the query. "
-
-        if recall < 0.5:
-            feedback += "Low recall: relevant documents pushed too low. "
-            feedback += "Ensure comprehensive explanations are prioritized. "
-
-        if position_improvement < 0.3:
-            feedback += "Document positions did not improve significantly. "
-            feedback += "Better identify which documents contain the answer. "
-
-        feedback += "Ranking criteria should prioritize: "
-        feedback += "(1) direct answers, (2) supporting details, (3) related context."
-
-        return feedback
+        return self._generate_rich_feedback(score, metrics, "", [], [])
 
 
 # =============================================================================

@@ -191,10 +191,15 @@ class GeneratorAdapter(RAGModuleAdapter):
         trajectory: RAGTrajectory,
     ) -> Dict[str, Any]:
         """
-        Format trajectory into GEPA reflection record.
+        Format trajectory into GEPA reflection record with rich feedback.
+
+        GEPA Best Practices Applied:
+        1. Include ground truth answer as a separate field
+        2. Show comparison between generated and expected
+        3. Provide specific, actionable improvement suggestions
 
         Returns:
-            Dict with Inputs, Generated Outputs, Feedback keys
+            Dict with Inputs, Generated Outputs, Expected Answer, Feedback keys
         """
         data = trajectory["data"]
         module_input = trajectory["module_input"]
@@ -209,80 +214,86 @@ class GeneratorAdapter(RAGModuleAdapter):
 
         inputs_text = f"Query: {query}\n\nContext:\n{context_preview}"
 
-        # Format outputs
+        # Format generated outputs
         answer = module_output.get("answer", "")
         reference = module_output.get("reference", "")
         rationale = module_output.get("rationale", "")
 
-        outputs_text = f"Answer: {answer}\n\nReference: {reference}\n\nRationale: {rationale}"
+        outputs_text = f"Generated Answer: {answer}"
+        if reference:
+            outputs_text += f"\n\nReference: {reference}"
+        if rationale:
+            outputs_text += f"\n\nRationale: {rationale}"
 
-        # Add ground truth for comparison
+        # Format expected answer separately (for GEPA's reflection LLM)
         ground_truth = data.get("ground_truth", "")
         if ground_truth:
-            outputs_text += f"\n\n[Ground Truth: {ground_truth}]"
+            expected_text = f"Expected Answer: {ground_truth}"
+        else:
+            expected_text = "Expected Answer: Not available"
 
-        # Generate feedback
-        feedback = self._generate_feedback(score, metrics)
+        # Generate rich feedback with ground truth comparison
+        feedback = self._generate_rich_feedback(score, metrics, ground_truth, answer)
 
         return {
             "Inputs": inputs_text,
             "Generated Outputs": outputs_text,
+            "Expected Answer": expected_text,
             "Feedback": feedback,
-            "Score": score,
-            "Metrics": metrics,
+            "Score": f"{score:.3f}",
         }
+
+    def _generate_rich_feedback(
+        self,
+        score: float,
+        metrics: Dict[str, float],
+        ground_truth: str,
+        generated_answer: str,
+    ) -> str:
+        """Generate rich feedback with contrastive comparison to ground truth."""
+        faithfulness = metrics.get("faithfulness", 0)
+        correctness = metrics.get("answer_correctness", 0)
+
+        # Determine performance tier (adaptive thresholds)
+        if score >= 0.6:
+            feedback = f"GOOD: Score={score:.2f}. "
+            feedback += f"Faithfulness={faithfulness:.2f}, Correctness={correctness:.2f}. "
+            feedback += "Answer is well-grounded and accurate. "
+            if ground_truth:
+                feedback += "Matches expected answer closely."
+        elif score >= 0.3:
+            feedback = f"PARTIAL: Score={score:.2f}. "
+            if faithfulness < correctness:
+                feedback += "ISSUE: Some claims not supported by context. "
+                feedback += "TRY: Only include information explicitly in context. "
+            elif correctness < faithfulness:
+                feedback += "ISSUE: Answer doesn't fully match expected response. "
+                if ground_truth:
+                    gt_preview = ground_truth[:200]
+                    feedback += f"EXPECTED: '{gt_preview}...'. "
+                feedback += "TRY: Focus on directly answering the question. "
+            else:
+                feedback += "Moderate quality. Improve both grounding and accuracy. "
+        else:
+            feedback = f"POOR: Score={score:.2f}. "
+            if faithfulness < 0.3:
+                feedback += "CRITICAL: Answer contains hallucinations. "
+            if correctness < 0.3:
+                feedback += "CRITICAL: Answer is incorrect. "
+            if ground_truth:
+                gt_preview = ground_truth[:250]
+                feedback += f"MUST PRODUCE: '{gt_preview}...'. "
+            feedback += "REQUIREMENTS: (1) Ground every claim in context, (2) Answer the question directly, (3) No made-up information."
+
+        return feedback
 
     def _positive_feedback(self, score: float, metrics: Dict[str, float]) -> str:
         """Generate positive feedback for high-quality generation"""
-        faithfulness = metrics.get("faithfulness", 0)
-        correctness = metrics.get("answer_correctness", 0)
-        has_reference = metrics.get("has_reference", False)
-
-        feedback = f"High-quality generation (score={score:.2f}). "
-
-        if faithfulness >= 0.8:
-            feedback += "Answer is well-grounded in the provided context. "
-
-        if correctness >= 0.8:
-            feedback += "Answer accurately addresses the query. "
-
-        if has_reference:
-            feedback += "Good use of references to support claims. "
-
-        feedback += "Continue focusing on accuracy and context-grounding."
-
-        return feedback
+        return self._generate_rich_feedback(score, metrics, "", "")
 
     def _negative_feedback(self, score: float, metrics: Dict[str, float]) -> str:
         """Generate improvement suggestions for low-quality generation"""
-        faithfulness = metrics.get("faithfulness", 0)
-        correctness = metrics.get("answer_correctness", 0)
-        has_reference = metrics.get("has_reference", False)
-        has_rationale = metrics.get("has_rationale", False)
-
-        feedback = f"Generation needs improvement (score={score:.2f}). "
-
-        if faithfulness < 0.5:
-            feedback += "LOW FAITHFULNESS: Answer contains claims not supported by context. "
-            feedback += "Only include information explicitly stated in the context. "
-
-        if correctness < 0.5:
-            feedback += "LOW CORRECTNESS: Answer does not match expected response. "
-            feedback += "Focus on directly answering the question asked. "
-
-        if not has_reference:
-            feedback += "Missing references: cite specific parts of context. "
-
-        if not has_rationale:
-            feedback += "Missing rationale: explain reasoning. "
-
-        if faithfulness >= 0.5 and correctness >= 0.5:
-            feedback += "Improve clarity and completeness of the answer. "
-
-        feedback += "Key improvements: (1) ground all claims in context, "
-        feedback += "(2) directly answer the question, (3) provide evidence."
-
-        return feedback
+        return self._generate_rich_feedback(score, metrics, "", "")
 
 
 # =============================================================================
