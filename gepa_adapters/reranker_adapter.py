@@ -16,19 +16,18 @@ GEPA Optimization Notes:
 - Provides contrastive examples for ranking criteria
 """
 
-from typing import Any, Dict, List, Optional, Tuple
-import re
-
-from gepa_adapters.base import (
-    RAGModuleAdapter,
-    RAGDataInst,
-    RAGTrajectory,
-    RAGRolloutOutput,
-)
-
 # Import module types
 import sys
 from pathlib import Path
+from typing import Any
+
+from gepa_adapters.base import (
+    RAGDataInst,
+    RAGModuleAdapter,
+    RAGRolloutOutput,
+    RAGTrajectory,
+)
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from modules.base import RerankerInput
@@ -73,7 +72,7 @@ class RerankerAdapter(RAGModuleAdapter):
     async def _run_single_async(
         self,
         data: RAGDataInst,
-    ) -> Tuple[RAGRolloutOutput, Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[RAGRolloutOutput, dict[str, Any], dict[str, Any]]:
         """
         Execute reranker on a single example.
 
@@ -95,11 +94,15 @@ class RerankerAdapter(RAGModuleAdapter):
         pre_rerank_chunk_indices = data.get("context_chunk_indices", [])
 
         if not documents:
-            return {
-                "result": None,
-                "success": False,
-                "error": "No documents provided for reranking",
-            }, {"query": query, "documents": []}, {}
+            return (
+                {
+                    "result": None,
+                    "success": False,
+                    "error": "No documents provided for reranking",
+                },
+                {"query": query, "documents": []},
+                {},
+            )
 
         # Run reranker
         reranker_input = RerankerInput(
@@ -109,7 +112,7 @@ class RerankerAdapter(RAGModuleAdapter):
         reranker_output = await self.module.run(reranker_input)
 
         # Package output
-        ranked_docs = reranker_output.ranked_documents[:self.top_k]
+        ranked_docs = reranker_output.ranked_documents[: self.top_k]
 
         # Map reranked documents to their chunk indices
         # Build doc -> index mapping from original order
@@ -132,7 +135,7 @@ class RerankerAdapter(RAGModuleAdapter):
         output: RAGRolloutOutput = {
             "result": {
                 "ranked_documents": ranked_docs,
-                "scores": reranker_output.scores[:self.top_k],
+                "scores": reranker_output.scores[: self.top_k],
                 "num_input": len(documents),
                 "num_output": len(ranked_docs),
                 "reranked_chunk_indices": reranked_chunk_indices,
@@ -150,7 +153,7 @@ class RerankerAdapter(RAGModuleAdapter):
 
         module_output = {
             "ranked_documents": ranked_docs,
-            "scores": reranker_output.scores[:self.top_k],
+            "scores": reranker_output.scores[: self.top_k],
             "original_order": documents,
             "reranked_chunk_indices": reranked_chunk_indices,
             "pre_rerank_chunk_indices": pre_rerank_chunk_indices,
@@ -161,8 +164,8 @@ class RerankerAdapter(RAGModuleAdapter):
     async def _compute_score_async(
         self,
         data: RAGDataInst,
-        module_output: Dict[str, Any],
-    ) -> Tuple[float, Dict[str, float]]:
+        module_output: dict[str, Any],
+    ) -> tuple[float, dict[str, float]]:
         """
         Compute reranking quality score using DETERMINISTIC ID-based metrics.
 
@@ -203,7 +206,7 @@ class RerankerAdapter(RAGModuleAdapter):
         reranker_eval = await self.evaluator._evaluate_reranker(
             input_data=RerankerInput(query=query, documents=original_order),
             output_data=RerankerOutputWithIndices(ranked_docs, reranked_chunk_indices),
-            ground_truth=gt_dict if (relevant_chunk_indices or ground_truth) else None
+            ground_truth=gt_dict if (relevant_chunk_indices or ground_truth) else None,
         )
 
         # Use NDCG as primary score (order-aware, deterministic)
@@ -219,7 +222,11 @@ class RerankerAdapter(RAGModuleAdapter):
             recall = reranker_eval.get("rerank_recall", 0.0)
             f1 = reranker_eval.get("rerank_f1", 0.0)
             if f1 == 0.0 and (precision > 0 or recall > 0):
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                f1 = (
+                    2 * precision * recall / (precision + recall)
+                    if (precision + recall) > 0
+                    else 0.0
+                )
             score = f1
         else:
             # Use deterministic metrics (preferred)
@@ -250,7 +257,7 @@ class RerankerAdapter(RAGModuleAdapter):
     def _format_trace_for_reflection(
         self,
         trajectory: RAGTrajectory,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Format trajectory into GEPA reflection record with rich feedback.
 
@@ -309,10 +316,10 @@ class RerankerAdapter(RAGModuleAdapter):
     def _generate_rich_feedback(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         ground_truth: str,
-        original_docs: List[str],
-        ranked_docs: List[str],
+        original_docs: list[str],
+        ranked_docs: list[str],
     ) -> str:
         """Generate rich feedback with contrastive examples for reranking."""
         ndcg = metrics.get("ndcg", 0)
@@ -343,11 +350,11 @@ class RerankerAdapter(RAGModuleAdapter):
 
         return feedback
 
-    def _positive_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _positive_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate positive feedback for effective reranking"""
         return self._generate_rich_feedback(score, metrics, "", [], [])
 
-    def _negative_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _negative_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate improvement suggestions for ineffective reranking"""
         return self._generate_rich_feedback(score, metrics, "", [], [])
 
@@ -355,6 +362,7 @@ class RerankerAdapter(RAGModuleAdapter):
 # =============================================================================
 # Utility: Create adapter with standard configuration
 # =============================================================================
+
 
 def create_reranker_adapter(
     reranker_module,

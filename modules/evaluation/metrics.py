@@ -4,8 +4,6 @@ Custom Metrics for RAG Pipeline Evaluation
 Provides module-specific metrics that complement RAGAS evaluation.
 """
 
-from typing import List, Dict, Any, Set
-
 
 def calculate_f1(precision: float, recall: float) -> float:
     """Calculate F1 score from precision and recall"""
@@ -14,21 +12,21 @@ def calculate_f1(precision: float, recall: float) -> float:
     return 0.0
 
 
-def calculate_precision(retrieved: Set[int], relevant: Set[int]) -> float:
+def calculate_precision(retrieved: set[int], relevant: set[int]) -> float:
     """Calculate precision: relevant retrieved / total retrieved"""
     if not retrieved:
         return 0.0
     return len(retrieved & relevant) / len(retrieved)
 
 
-def calculate_recall(retrieved: Set[int], relevant: Set[int]) -> float:
+def calculate_recall(retrieved: set[int], relevant: set[int]) -> float:
     """Calculate recall: relevant retrieved / total relevant"""
     if not relevant:
         return 0.0
     return len(retrieved & relevant) / len(relevant)
 
 
-def calculate_mrr(ranked_list: List[int], relevant: Set[int]) -> float:
+def calculate_mrr(ranked_list: list[int], relevant: set[int]) -> float:
     """
     Calculate Mean Reciprocal Rank.
 
@@ -40,7 +38,7 @@ def calculate_mrr(ranked_list: List[int], relevant: Set[int]) -> float:
     return 0.0
 
 
-def calculate_ndcg(ranked_list: List[int], relevant: Set[int], k: int = None) -> float:
+def calculate_ndcg(ranked_list: list[int], relevant: set[int], k: int = None) -> float:
     """
     Calculate Normalized Discounted Cumulative Gain.
 
@@ -71,7 +69,7 @@ def calculate_ndcg(ranked_list: List[int], relevant: Set[int], k: int = None) ->
     return dcg / idcg
 
 
-def calculate_map(ranked_list: List[int], relevant: Set[int]) -> float:
+def calculate_map(ranked_list: list[int], relevant: set[int]) -> float:
     """
     Calculate Mean Average Precision.
 
@@ -100,10 +98,8 @@ class RetrievalMetrics:
 
     @staticmethod
     def evaluate(
-        retrieved_indices: List[int],
-        relevant_indices: List[int],
-        k: int = None
-    ) -> Dict[str, float]:
+        retrieved_indices: list[int], relevant_indices: list[int], k: int = None
+    ) -> dict[str, float]:
         """
         Evaluate retrieval quality with multiple metrics.
 
@@ -130,12 +126,12 @@ class RetrievalMetrics:
         map_score = calculate_map(retrieved_k, relevant_set)
 
         return {
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'mrr': mrr,
-            'ndcg': ndcg,
-            'map': map_score,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "mrr": mrr,
+            "ndcg": ndcg,
+            "map": map_score,
         }
 
 
@@ -144,11 +140,11 @@ class RerankerMetrics:
 
     @staticmethod
     def evaluate_improvement(
-        pre_rerank_indices: List[int],
-        post_rerank_indices: List[int],
-        relevant_indices: List[int],
-        k: int = None
-    ) -> Dict[str, float]:
+        pre_rerank_indices: list[int],
+        post_rerank_indices: list[int],
+        relevant_indices: list[int],
+        k: int = None,
+    ) -> dict[str, float]:
         """
         Evaluate reranking improvement over original retrieval order.
 
@@ -159,28 +155,23 @@ class RerankerMetrics:
         post_metrics = RetrievalMetrics.evaluate(post_rerank_indices, relevant_indices, k)
 
         improvement = {
-            'pre_precision': pre_metrics['precision'],
-            'post_precision': post_metrics['precision'],
-            'precision_delta': post_metrics['precision'] - pre_metrics['precision'],
-
-            'pre_recall': pre_metrics['recall'],
-            'post_recall': post_metrics['recall'],
-            'recall_delta': post_metrics['recall'] - pre_metrics['recall'],
-
-            'pre_ndcg': pre_metrics['ndcg'],
-            'post_ndcg': post_metrics['ndcg'],
-            'ndcg_delta': post_metrics['ndcg'] - pre_metrics['ndcg'],
-
-            'pre_mrr': pre_metrics['mrr'],
-            'post_mrr': post_metrics['mrr'],
-            'mrr_delta': post_metrics['mrr'] - pre_metrics['mrr'],
+            "pre_precision": pre_metrics["precision"],
+            "post_precision": post_metrics["precision"],
+            "precision_delta": post_metrics["precision"] - pre_metrics["precision"],
+            "pre_recall": pre_metrics["recall"],
+            "post_recall": post_metrics["recall"],
+            "recall_delta": post_metrics["recall"] - pre_metrics["recall"],
+            "pre_ndcg": pre_metrics["ndcg"],
+            "post_ndcg": post_metrics["ndcg"],
+            "ndcg_delta": post_metrics["ndcg"] - pre_metrics["ndcg"],
+            "pre_mrr": pre_metrics["mrr"],
+            "post_mrr": post_metrics["mrr"],
+            "mrr_delta": post_metrics["mrr"] - pre_metrics["mrr"],
         }
 
         # Overall improvement score
-        improvement['overall_improvement'] = (
-            improvement['precision_delta'] +
-            improvement['ndcg_delta'] +
-            improvement['mrr_delta']
+        improvement["overall_improvement"] = (
+            improvement["precision_delta"] + improvement["ndcg_delta"] + improvement["mrr_delta"]
         ) / 3
 
         return improvement
@@ -190,11 +181,7 @@ class GenerationMetrics:
     """Metrics for evaluating generation quality (non-LLM based)"""
 
     @staticmethod
-    def evaluate_basic(
-        answer: str,
-        ground_truth: str,
-        context: str
-    ) -> Dict[str, float]:
+    def evaluate_basic(answer: str, ground_truth: str, context: str) -> dict[str, float]:
         """
         Basic generation metrics (without LLM evaluation).
 
@@ -209,12 +196,14 @@ class GenerationMetrics:
         context_words = set(context.lower().split())
         gt_words = set(ground_truth.lower().split()) if ground_truth else set()
 
-        context_overlap = len(answer_words & context_words) / len(answer_words) if answer_words else 0
+        context_overlap = (
+            len(answer_words & context_words) / len(answer_words) if answer_words else 0
+        )
         gt_overlap = len(answer_words & gt_words) / len(gt_words) if gt_words else 0
 
         return {
-            'answer_length': len(answer),
-            'answer_length_ratio': answer_length_ratio,
-            'context_term_overlap': context_overlap,
-            'ground_truth_term_overlap': gt_overlap,
+            "answer_length": len(answer),
+            "answer_length_ratio": answer_length_ratio,
+            "context_term_overlap": context_overlap,
+            "ground_truth_term_overlap": gt_overlap,
         }

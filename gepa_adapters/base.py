@@ -25,12 +25,15 @@ Usage with gepa.optimize():
 
 import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, TypeVar, TypedDict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Generic, TypedDict, TypeVar
 
 # Import GEPA types - use actual library when available
 try:
-    from gepa.core.adapter import GEPAAdapter, EvaluationBatch as GEPAEvaluationBatch
+    from gepa.core.adapter import EvaluationBatch as GEPAEvaluationBatch
+    from gepa.core.adapter import GEPAAdapter
+
     GEPA_AVAILABLE = True
 except ImportError:
     print("⚠️  GEPA not installed. Install with: pip install gepa-ai")
@@ -43,6 +46,7 @@ except ImportError:
 # GEPA Type Definitions (matching gepa-ai/gepa protocol)
 # =============================================================================
 
+
 class RAGDataInst(TypedDict):
     """
     Data instance for RAG module evaluation.
@@ -54,11 +58,12 @@ class RAGDataInst(TypedDict):
         contexts: Pre-retrieved documents (for reranker/generator)
         metadata: Additional task-specific data
     """
+
     query: str
-    ground_truth: Optional[str]
-    relevant_chunk_indices: Optional[List[int]]
-    contexts: Optional[List[str]]
-    metadata: Dict[str, Any]
+    ground_truth: str | None
+    relevant_chunk_indices: list[int] | None
+    contexts: list[str] | None
+    metadata: dict[str, Any]
 
 
 class RAGTrajectory(TypedDict):
@@ -73,12 +78,13 @@ class RAGTrajectory(TypedDict):
         score: Evaluation score for this example
         metrics: Detailed metric breakdown
     """
+
     data: RAGDataInst
-    module_input: Dict[str, Any]
-    module_output: Dict[str, Any]
-    intermediate_steps: List[Dict[str, Any]]
+    module_input: dict[str, Any]
+    module_output: dict[str, Any]
+    intermediate_steps: list[dict[str, Any]]
     score: float
-    metrics: Dict[str, float]
+    metrics: dict[str, float]
 
 
 class RAGRolloutOutput(TypedDict):
@@ -90,9 +96,10 @@ class RAGRolloutOutput(TypedDict):
         success: Whether execution succeeded
         error: Error message if failed
     """
+
     result: Any
     success: bool
-    error: Optional[str]
+    error: str | None
 
 
 Trajectory = TypeVar("Trajectory")
@@ -113,9 +120,10 @@ class EvaluationBatch(Generic[Trajectory, RolloutOutput]):
         scores: Per-example scores (higher is better)
         trajectories: Optional execution traces for reflection
     """
-    outputs: List[RolloutOutput]
-    scores: List[float]
-    trajectories: Optional[List[Trajectory]] = None
+
+    outputs: list[RolloutOutput]
+    scores: list[float]
+    trajectories: list[Trajectory] | None = None
 
     @property
     def aggregate_score(self) -> float:
@@ -187,7 +195,7 @@ class RAGModuleAdapter(_BaseClass):
         self.evaluator = evaluator
         self.component_name = component_name
         self.failure_score = failure_score
-        self._original_prompt: Optional[str] = None
+        self._original_prompt: str | None = None
 
     # -------------------------------------------------------------------------
     # Prompt Management
@@ -198,7 +206,7 @@ class RAGModuleAdapter(_BaseClass):
         """Get the current prompt from the module"""
         return self.module.prompt or ""
 
-    def inject_prompt(self, candidate: Dict[str, str]) -> None:
+    def inject_prompt(self, candidate: dict[str, str]) -> None:
         """Inject candidate prompt into the module"""
         if self.component_name in candidate:
             if self._original_prompt is None:
@@ -211,7 +219,7 @@ class RAGModuleAdapter(_BaseClass):
             self.module.prompt = self._original_prompt
             self._original_prompt = None
 
-    def get_candidate(self) -> Dict[str, str]:
+    def get_candidate(self) -> dict[str, str]:
         """Get current prompt as a candidate dict"""
         return {self.component_name: self.current_prompt}
 
@@ -223,7 +231,7 @@ class RAGModuleAdapter(_BaseClass):
     async def _run_single_async(
         self,
         data: RAGDataInst,
-    ) -> tuple[RAGRolloutOutput, Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[RAGRolloutOutput, dict[str, Any], dict[str, Any]]:
         """
         Execute the module on a single data instance (async).
 
@@ -239,8 +247,8 @@ class RAGModuleAdapter(_BaseClass):
     async def _compute_score_async(
         self,
         data: RAGDataInst,
-        module_output: Dict[str, Any],
-    ) -> tuple[float, Dict[str, float]]:
+        module_output: dict[str, Any],
+    ) -> tuple[float, dict[str, float]]:
         """
         Compute evaluation score for module output (async).
 
@@ -257,7 +265,7 @@ class RAGModuleAdapter(_BaseClass):
     def _format_trace_for_reflection(
         self,
         trajectory: RAGTrajectory,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Format a trajectory into a reflection record for GEPA.
 
@@ -280,8 +288,8 @@ class RAGModuleAdapter(_BaseClass):
 
     def evaluate(
         self,
-        batch: List[RAGDataInst],
-        candidate: Dict[str, str],
+        batch: list[RAGDataInst],
+        candidate: dict[str, str],
         capture_traces: bool = False,
     ) -> EvaluationBatch[RAGTrajectory, RAGRolloutOutput]:
         """
@@ -306,21 +314,20 @@ class RAGModuleAdapter(_BaseClass):
             # We're in an existing event loop - use loop.run_until_complete or thread
             try:
                 import nest_asyncio
+
                 nest_asyncio.apply()
                 # Use the existing loop instead of creating a new one
                 future = asyncio.ensure_future(
-                    self._evaluate_async(batch, candidate, capture_traces),
-                    loop=loop
+                    self._evaluate_async(batch, candidate, capture_traces), loop=loop
                 )
                 return loop.run_until_complete(future)
             except ImportError:
                 # nest_asyncio not available - run in separate thread with new loop
                 import concurrent.futures
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(
-                        lambda: asyncio.run(
-                            self._evaluate_async(batch, candidate, capture_traces)
-                        )
+                        lambda: asyncio.run(self._evaluate_async(batch, candidate, capture_traces))
                     )
                     return future.result()
         except RuntimeError:
@@ -329,8 +336,8 @@ class RAGModuleAdapter(_BaseClass):
 
     async def _evaluate_async(
         self,
-        batch: List[RAGDataInst],
-        candidate: Dict[str, str],
+        batch: list[RAGDataInst],
+        candidate: dict[str, str],
         capture_traces: bool = False,
     ) -> EvaluationBatch[RAGTrajectory, RAGRolloutOutput]:
         """
@@ -347,9 +354,9 @@ class RAGModuleAdapter(_BaseClass):
         # Inject the candidate prompt
         self.inject_prompt(candidate)
 
-        outputs: List[RAGRolloutOutput] = []
-        scores: List[float] = []
-        trajectories: Optional[List[RAGTrajectory]] = [] if capture_traces else None
+        outputs: list[RAGRolloutOutput] = []
+        scores: list[float] = []
+        trajectories: list[RAGTrajectory] | None = [] if capture_traces else None
 
         try:
             for data in batch:
@@ -377,22 +384,26 @@ class RAGModuleAdapter(_BaseClass):
 
                 except Exception as e:
                     # Handle individual example failures
-                    outputs.append({
-                        "result": None,
-                        "success": False,
-                        "error": str(e),
-                    })
+                    outputs.append(
+                        {
+                            "result": None,
+                            "success": False,
+                            "error": str(e),
+                        }
+                    )
                     scores.append(self.failure_score)
 
                     if capture_traces:
-                        trajectories.append({
-                            "data": data,
-                            "module_input": {},
-                            "module_output": {},
-                            "intermediate_steps": [],
-                            "score": self.failure_score,
-                            "metrics": {},
-                        })
+                        trajectories.append(
+                            {
+                                "data": data,
+                                "module_input": {},
+                                "module_output": {},
+                                "intermediate_steps": [],
+                                "score": self.failure_score,
+                                "metrics": {},
+                            }
+                        )
 
             return EvaluationBatch(
                 outputs=outputs,
@@ -410,9 +421,9 @@ class RAGModuleAdapter(_BaseClass):
 
     def make_reflective_dataset(
         self,
-        candidate: Dict[str, str],
+        candidate: dict[str, str],
         eval_batch: EvaluationBatch[RAGTrajectory, RAGRolloutOutput],
-        components_to_update: List[str],
+        components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:
         """
         Generate a reflection dataset for prompt evolution.
@@ -434,7 +445,7 @@ class RAGModuleAdapter(_BaseClass):
             return {self.component_name: []}
 
         # Create reflection records from trajectories
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
 
         for trajectory in eval_batch.trajectories:
             record = self._format_trace_for_reflection(trajectory)
@@ -449,7 +460,7 @@ class RAGModuleAdapter(_BaseClass):
     def _generate_feedback(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         threshold: float = 0.7,
     ) -> str:
         """
@@ -465,16 +476,15 @@ class RAGModuleAdapter(_BaseClass):
         """
         if score >= threshold:
             return self._positive_feedback(score, metrics)
-        else:
-            return self._negative_feedback(score, metrics)
+        return self._negative_feedback(score, metrics)
 
     @abstractmethod
-    def _positive_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _positive_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate positive feedback for high-scoring examples"""
         pass
 
     @abstractmethod
-    def _negative_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _negative_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate negative feedback with improvement suggestions"""
         pass
 
@@ -489,13 +499,13 @@ MIN_RECOMMENDED_BUDGET = 100
 
 def optimize_prompt(
     adapter: RAGModuleAdapter,
-    trainset: List[RAGDataInst],
-    valset: Optional[List[RAGDataInst]] = None,
+    trainset: list[RAGDataInst],
+    valset: list[RAGDataInst] | None = None,
     max_metric_calls: int = 100,
     reflection_lm: str = "openai/gpt-4o-mini",
-    seed_prompt: Optional[str] = None,
+    seed_prompt: str | None = None,
     **kwargs,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Run GEPA optimization to find the best prompt for a module.
 
@@ -544,9 +554,11 @@ def optimize_prompt(
 
     # Budget warning
     if max_metric_calls < MIN_RECOMMENDED_BUDGET:
-        print(f"\n⚠️  WARNING: Budget ({max_metric_calls}) is below recommended minimum ({MIN_RECOMMENDED_BUDGET}).")
-        print(f"   GEPA may not have enough iterations to find improvements.")
-        print(f"   Consider increasing to 100-200 for better results.\n")
+        print(
+            f"\n⚠️  WARNING: Budget ({max_metric_calls}) is below recommended minimum ({MIN_RECOMMENDED_BUDGET})."
+        )
+        print("   GEPA may not have enough iterations to find improvements.")
+        print("   Consider increasing to 100-200 for better results.\n")
 
     import gepa
 
@@ -557,9 +569,9 @@ def optimize_prompt(
     else:
         seed_candidate = adapter.get_candidate()
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"GEPA Prompt Optimization: {component_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Training examples: {len(trainset)}")
     print(f"Validation examples: {len(valset) if valset else 'Using trainset'}")
     print(f"Budget: {max_metric_calls} metric calls")
@@ -578,23 +590,23 @@ def optimize_prompt(
 
     # Extract best prompt and score from GEPAResult
     # GEPAResult has: candidates, val_aggregate_scores, best_idx, best_candidate
-    best_idx = getattr(result, 'best_idx', 0)
-    candidates = getattr(result, 'candidates', [])
-    val_scores = getattr(result, 'val_aggregate_scores', [])
-    
+    best_idx = getattr(result, "best_idx", 0)
+    candidates = getattr(result, "candidates", [])
+    val_scores = getattr(result, "val_aggregate_scores", [])
+
     # Get best candidate
-    best_candidate = getattr(result, 'best_candidate', None)
+    best_candidate = getattr(result, "best_candidate", None)
     if best_candidate is None and candidates:
         best_candidate = candidates[best_idx] if best_idx < len(candidates) else candidates[0]
-    
+
     best_prompt = best_candidate.get(component_name, "") if isinstance(best_candidate, dict) else ""
-    
+
     # Get best score
     best_score = val_scores[best_idx] if val_scores and best_idx < len(val_scores) else 0.0
 
-    print(f"\n{'='*60}")
-    print(f"Optimization Complete")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("Optimization Complete")
+    print(f"{'=' * 60}")
     print(f"Best score (valset): {best_score:.4f}")
     print(f"Total candidates: {len(candidates)}")
     print(f"Optimized prompt length: {len(best_prompt)} chars")

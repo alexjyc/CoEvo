@@ -13,7 +13,7 @@ from modules.query_planner.planner import QueryPlannerModule, QueryPlannerRespon
 from modules.query_planner.retrieval import HybridRetriever
 
 __all__ = [
+    "HybridRetriever",
     "QueryPlannerModule",
     "QueryPlannerResponse",
-    "HybridRetriever",
 ]

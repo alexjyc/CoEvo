@@ -9,31 +9,25 @@ Evaluation Metrics: faithfulness, answer_relevancy, answer_correctness
 
 import os
 from pathlib import Path
-from typing import Optional
 
-from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from modules.base import (
-    Module,
-    ModuleType,
     GeneratorInput,
     GeneratorOutput,
+    Module,
+    ModuleType,
 )
 
 
 class AnswerGenerationResponse(BaseModel):
     """Structured response from generator LLM"""
-    answer: str = Field(
-        description="The generated answer to the query"
-    )
-    reference: str = Field(
-        description="Evidence from the context that supports the answer"
-    )
-    rationale: str = Field(
-        description="Explanation of how the answer was generated"
-    )
+
+    answer: str = Field(description="The generated answer to the query")
+    reference: str = Field(description="Evidence from the context that supports the answer")
+    rationale: str = Field(description="Explanation of how the answer was generated")
 
 
 class GeneratorModule(Module[GeneratorInput, GeneratorOutput]):
@@ -49,7 +43,7 @@ class GeneratorModule(Module[GeneratorInput, GeneratorOutput]):
     def __init__(
         self,
         model_name: str = "gpt-4o-mini",
-        prompt_path: Optional[Path] = None,
+        prompt_path: Path | None = None,
     ):
         super().__init__(ModuleType.GENERATOR)
         self.model_name = model_name
@@ -57,15 +51,11 @@ class GeneratorModule(Module[GeneratorInput, GeneratorOutput]):
         # Initialize LLM (frozen - only prompt changes)
         if model_name in ["gpt-4o-mini", "gpt-4o", "gpt-5-nano"]:
             self.llm = ChatOpenAI(
-                model=model_name,
-                temperature=0,
-                openai_api_key=os.getenv("OPENAI_API_KEY")
+                model=model_name, temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY")
             )
         elif model_name == "gemini-2.5-flash":
             self.llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                temperature=0,
-                google_api_key=os.getenv("GEMINI_API_KEY")
+                model=model_name, temperature=0, google_api_key=os.getenv("GEMINI_API_KEY")
             )
         else:
             raise ValueError(f"Unsupported model: {model_name}")
@@ -110,18 +100,14 @@ Provide a thorough answer:"""
         """
         try:
             # Format prompt
-            prompt = self._prompt.format(
-                context=input.context,
-                query=input.query
-            )
+            prompt = self._prompt.format(context=input.context, query=input.query)
 
             # Get structured output from LLM
             structured_llm = self.llm.with_structured_output(AnswerGenerationResponse)
 
-            response: AnswerGenerationResponse = await structured_llm.ainvoke([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": input.query}
-            ])
+            response: AnswerGenerationResponse = await structured_llm.ainvoke(
+                [{"role": "system", "content": prompt}, {"role": "user", "content": input.query}]
+            )
 
             return GeneratorOutput(
                 status="success",
@@ -132,7 +118,7 @@ Provide a thorough answer:"""
                     "model": self.model_name,
                     "answer_length": len(response.answer),
                     "context_length": len(input.context),
-                }
+                },
             )
 
         except Exception as e:

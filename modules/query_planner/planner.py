@@ -10,10 +10,9 @@ Evaluation Metrics: context_precision, context_recall (via retrieval results)
 
 import os
 from pathlib import Path
-from typing import Optional, Union, List
 
-from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from modules.base import (
@@ -26,10 +25,11 @@ from modules.base import (
 
 class QueryPlannerResponse(BaseModel):
     """Structured response from query planner LLM"""
+
     mode: str = Field(
         description="The mode of the query planner. Either 'decomposition' or 'reformulation'."
     )
-    query: Union[str, List[str]] = Field(
+    query: str | list[str] = Field(
         description="The query to be planned. If decomposition, list of sub-queries. If reformulation, single query."
     )
 
@@ -47,7 +47,7 @@ class QueryPlannerModule(Module[QueryPlannerInput, QueryPlannerOutput]):
     def __init__(
         self,
         model_name: str = "gpt-4o-mini",
-        prompt_path: Optional[Path] = None,
+        prompt_path: Path | None = None,
     ):
         super().__init__(ModuleType.QUERY_PLANNER)
         self.model_name = model_name
@@ -55,15 +55,11 @@ class QueryPlannerModule(Module[QueryPlannerInput, QueryPlannerOutput]):
         # Initialize LLM (frozen - only prompt changes)
         if model_name in ["gpt-4o-mini", "gpt-4o", "gpt-5-nano"]:
             self.llm = ChatOpenAI(
-                model=model_name,
-                temperature=0,
-                openai_api_key=os.getenv("OPENAI_API_KEY")
+                model=model_name, temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY")
             )
         elif model_name == "gemini-2.5-flash":
             self.llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                temperature=0,
-                google_api_key=os.getenv("GEMINI_API_KEY")
+                model=model_name, temperature=0, google_api_key=os.getenv("GEMINI_API_KEY")
             )
         else:
             raise ValueError(f"Unsupported model: {model_name}")
@@ -77,7 +73,7 @@ class QueryPlannerModule(Module[QueryPlannerInput, QueryPlannerOutput]):
     def get_default_prompt(self) -> str:
         """Return the seed prompt for query planning"""
         seed_path = Path(__file__).parent / "prompts" / "seed.txt"
-        
+
         if seed_path.exists():
             return seed_path.read_text()
 
@@ -110,10 +106,9 @@ Provide mode (decomposition/reformulation) and query/queries:"""
             # Get structured output from LLM
             structured_llm = self.llm.with_structured_output(QueryPlannerResponse)
 
-            response: QueryPlannerResponse = await structured_llm.ainvoke([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": input.query}
-            ])
+            response: QueryPlannerResponse = await structured_llm.ainvoke(
+                [{"role": "system", "content": prompt}, {"role": "user", "content": input.query}]
+            )
 
             # Normalize output to list of queries
             if isinstance(response.query, str):
@@ -129,7 +124,7 @@ Provide mode (decomposition/reformulation) and query/queries:"""
                 metadata={
                     "model": self.model_name,
                     "num_queries": len(queries),
-                }
+                },
             )
 
         except Exception as e:

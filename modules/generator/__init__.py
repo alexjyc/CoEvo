@@ -8,9 +8,9 @@ Optimization Target: Generation prompt
 Evaluation Metrics: faithfulness, answer_relevancy, answer_correctness
 """
 
-from modules.generator.generator import GeneratorModule, AnswerGenerationResponse
+from modules.generator.generator import AnswerGenerationResponse, GeneratorModule
 
 __all__ = [
-    "GeneratorModule",
     "AnswerGenerationResponse",
+    "GeneratorModule",
 ]

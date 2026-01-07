@@ -16,19 +16,20 @@ GEPA Optimization Notes:
 - Provides contrastive examples showing what queries should have targeted
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Set
 import re
-
-from gepa_adapters.base import (
-    RAGModuleAdapter,
-    RAGDataInst,
-    RAGTrajectory,
-    RAGRolloutOutput,
-)
 
 # Import module types
 import sys
 from pathlib import Path
+from typing import Any
+
+from gepa_adapters.base import (
+    RAGDataInst,
+    RAGModuleAdapter,
+    RAGRolloutOutput,
+    RAGTrajectory,
+)
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from modules.base import QueryPlannerInput, RetrievalInput
@@ -55,19 +56,120 @@ class QueryPlannerAdapter(RAGModuleAdapter):
 
     # Stopwords to filter when extracting key concepts
     STOPWORDS = {
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-        'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
-        'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
-        'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above',
-        'below', 'between', 'under', 'again', 'further', 'then', 'once', 'here',
-        'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more',
-        'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own',
-        'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or',
-        'because', 'until', 'while', 'although', 'though', 'after', 'before',
-        'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom',
-        'its', 'it', 'he', 'she', 'they', 'them', 'his', 'her', 'their', 'my',
-        'your', 'our', 'we', 'you', 'i', 'me', 'him', 'us', 'answer', 'question',
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "can",
+        "need",
+        "dare",
+        "ought",
+        "used",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "under",
+        "again",
+        "further",
+        "then",
+        "once",
+        "here",
+        "there",
+        "when",
+        "where",
+        "why",
+        "how",
+        "all",
+        "each",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "no",
+        "nor",
+        "not",
+        "only",
+        "own",
+        "same",
+        "so",
+        "than",
+        "too",
+        "very",
+        "just",
+        "and",
+        "but",
+        "if",
+        "or",
+        "because",
+        "until",
+        "while",
+        "although",
+        "though",
+        "this",
+        "that",
+        "these",
+        "those",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "its",
+        "it",
+        "he",
+        "she",
+        "they",
+        "them",
+        "his",
+        "her",
+        "their",
+        "my",
+        "your",
+        "our",
+        "we",
+        "you",
+        "i",
+        "me",
+        "him",
+        "us",
+        "answer",
+        "question",
     }
 
     def __init__(
@@ -99,12 +201,14 @@ class QueryPlannerAdapter(RAGModuleAdapter):
         self.primary_metric = primary_metric.lower()
 
         if self.primary_metric not in ("ndcg", "mrr", "f1"):
-            raise ValueError(f"primary_metric must be 'ndcg', 'mrr', or 'f1', got '{primary_metric}'")
+            raise ValueError(
+                f"primary_metric must be 'ndcg', 'mrr', or 'f1', got '{primary_metric}'"
+            )
 
     async def _run_single_async(
         self,
         data: RAGDataInst,
-    ) -> Tuple[RAGRolloutOutput, Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[RAGRolloutOutput, dict[str, Any], dict[str, Any]]:
         """
         Execute query planner and retriever on a single example.
 
@@ -128,7 +232,7 @@ class QueryPlannerAdapter(RAGModuleAdapter):
         # Step 2: Run retriever with generated queries
         retrieval_input = RetrievalInput(
             queries=planner_output.queries,
-            top_k=20  # Standard retrieval depth
+            top_k=20,  # Standard retrieval depth
         )
         retrieval_output = await self.retriever.run(retrieval_input)
 
@@ -162,8 +266,8 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     async def _compute_score_async(
         self,
         data: RAGDataInst,
-        module_output: Dict[str, Any],
-    ) -> Tuple[float, Dict[str, float]]:
+        module_output: dict[str, Any],
+    ) -> tuple[float, dict[str, float]]:
         """
         Compute retrieval quality score using chunk-level metrics.
 
@@ -186,7 +290,13 @@ class QueryPlannerAdapter(RAGModuleAdapter):
 
         if not relevant_indices:
             # No ground truth available, return neutral score
-            return 0.5, {"context_precision": 0.5, "context_recall": 0.5, "f1": 0.5, "ndcg": 0.5, "mrr": 0.5}
+            return 0.5, {
+                "context_precision": 0.5,
+                "context_recall": 0.5,
+                "f1": 0.5,
+                "ndcg": 0.5,
+                "mrr": 0.5,
+            }
 
         # Use RetrievalMetrics for chunk-level evaluation
         eval_result = RetrievalMetrics.evaluate(
@@ -226,7 +336,7 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     # Key Concept Extraction (for contrastive feedback)
     # -------------------------------------------------------------------------
 
-    def _extract_key_concepts(self, text: str, max_concepts: int = 10) -> List[str]:
+    def _extract_key_concepts(self, text: str, max_concepts: int = 10) -> list[str]:
         """
         Extract key concepts/terms from text for contrastive feedback.
 
@@ -243,16 +353,13 @@ class QueryPlannerAdapter(RAGModuleAdapter):
             return []
 
         # Tokenize and clean
-        words = re.findall(r'\b[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]\b|\b[a-zA-Z]\b', text.lower())
+        words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]\b|\b[a-zA-Z]\b", text.lower())
 
         # Filter stopwords and short words
-        meaningful_words = [
-            w for w in words
-            if w not in self.STOPWORDS and len(w) > 2
-        ]
+        meaningful_words = [w for w in words if w not in self.STOPWORDS and len(w) > 2]
 
         # Count frequency
-        word_freq: Dict[str, int] = {}
+        word_freq: dict[str, int] = {}
         for w in meaningful_words:
             word_freq[w] = word_freq.get(w, 0) + 1
 
@@ -262,9 +369,9 @@ class QueryPlannerAdapter(RAGModuleAdapter):
 
     def _find_missing_concepts(
         self,
-        generated_queries: List[str],
+        generated_queries: list[str],
         ground_truth: str,
-    ) -> List[str]:
+    ) -> list[str]:
         """
         Find concepts from ground truth that are missing from generated queries.
 
@@ -297,7 +404,7 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     def _format_trace_for_reflection(
         self,
         trajectory: RAGTrajectory,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Format trajectory into GEPA reflection record with rich feedback.
 
@@ -317,7 +424,7 @@ class QueryPlannerAdapter(RAGModuleAdapter):
         metrics = trajectory["metrics"]
 
         # Extract key information
-        query = module_input.get('query', data.get('query', ''))
+        query = module_input.get("query", data.get("query", ""))
         ground_truth = data.get("ground_truth", "")
         mode = module_output.get("mode", "unknown")
         queries = module_output.get("queries", [])
@@ -373,9 +480,9 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     def _generate_rich_feedback(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         ground_truth: str,
-        generated_queries: List[str],
+        generated_queries: list[str],
         mode: str,
     ) -> str:
         """
@@ -404,18 +511,21 @@ class QueryPlannerAdapter(RAGModuleAdapter):
         # Determine performance tier using adaptive thresholds
         # (relative to typical RAG performance, not absolute 0.7)
         if score >= 0.5:
-            return self._positive_feedback_rich(score, metrics, ground_truth, generated_queries, mode)
-        elif score >= 0.2:
-            return self._partial_feedback_rich(score, metrics, ground_truth, generated_queries, mode)
-        else:
-            return self._negative_feedback_rich(score, metrics, ground_truth, generated_queries, mode)
+            return self._positive_feedback_rich(
+                score, metrics, ground_truth, generated_queries, mode
+            )
+        if score >= 0.2:
+            return self._partial_feedback_rich(
+                score, metrics, ground_truth, generated_queries, mode
+            )
+        return self._negative_feedback_rich(score, metrics, ground_truth, generated_queries, mode)
 
     def _positive_feedback_rich(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         ground_truth: str,
-        generated_queries: List[str],
+        generated_queries: list[str],
         mode: str,
     ) -> str:
         """Generate positive feedback with reinforcement of what worked"""
@@ -449,9 +559,9 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     def _partial_feedback_rich(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         ground_truth: str,
-        generated_queries: List[str],
+        generated_queries: list[str],
         mode: str,
     ) -> str:
         """Generate feedback for partial success with specific improvements"""
@@ -487,9 +597,9 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     def _negative_feedback_rich(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         ground_truth: str,
-        generated_queries: List[str],
+        generated_queries: list[str],
         mode: str,
     ) -> str:
         """Generate detailed negative feedback with contrastive examples"""
@@ -513,7 +623,7 @@ class QueryPlannerAdapter(RAGModuleAdapter):
                 feedback += f"MUST INCLUDE these concepts: {', '.join(missing[:6])}. "
 
             # Show what the answer contains
-            gt_preview = ground_truth[:150].replace('\n', ' ')
+            gt_preview = ground_truth[:150].replace("\n", " ")
             feedback += f"TARGET: The answer discusses '{gt_preview}...'. "
 
         # Concrete suggestions
@@ -530,11 +640,11 @@ class QueryPlannerAdapter(RAGModuleAdapter):
     # Legacy feedback methods (kept for compatibility, delegate to rich versions)
     # -------------------------------------------------------------------------
 
-    def _positive_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _positive_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate positive feedback for high-scoring query planning"""
         return self._positive_feedback_rich(score, metrics, "", [], "reformulation")
 
-    def _negative_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _negative_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate improvement suggestions for low-scoring query planning"""
         return self._negative_feedback_rich(score, metrics, "", [], "reformulation")
 
@@ -542,6 +652,7 @@ class QueryPlannerAdapter(RAGModuleAdapter):
 # =============================================================================
 # Utility: Create adapter with standard configuration
 # =============================================================================
+
 
 def create_query_planner_adapter(
     query_planner_module,

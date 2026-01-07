@@ -8,16 +8,17 @@ Each module in the RAG pipeline must:
 4. Be serializable for logging and evaluation
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, TypeVar, Generic
-from enum import Enum
 import json
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
+from typing import Any, Generic, TypeVar
 
 
 class ModuleType(Enum):
     """Module identifiers for the RAG pipeline"""
+
     QUERY_PLANNER = "query_planner"
     RETRIEVAL = "retrieval"
     RERANKER = "reranker"
@@ -28,32 +29,33 @@ class ModuleType(Enum):
 class ModuleInput:
     """Base class for module inputs - all inputs must be serializable"""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), default=str)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ModuleInput":
+    def from_dict(cls, data: dict[str, Any]) -> "ModuleInput":
         return cls(**data)
 
 
 @dataclass
 class ModuleOutput:
     """Base class for module outputs - all outputs must be serializable"""
-    status: str = "success"  # "success" or "error"
-    error_message: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    status: str = "success"  # "success" or "error"
+    error_message: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), default=str)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ModuleOutput":
+    def from_dict(cls, data: dict[str, Any]) -> "ModuleOutput":
         return cls(**data)
 
 
@@ -74,8 +76,8 @@ class Module(ABC, Generic[InputT, OutputT]):
 
     def __init__(self, module_type: ModuleType):
         self.module_type = module_type
-        self._prompt: Optional[str] = None
-        self._original_prompt: Optional[str] = None
+        self._prompt: str | None = None
+        self._original_prompt: str | None = None
 
     @abstractmethod
     async def run(self, input: InputT) -> OutputT:
@@ -91,7 +93,7 @@ class Module(ABC, Generic[InputT, OutputT]):
         pass
 
     @property
-    def prompt(self) -> Optional[str]:
+    def prompt(self) -> str | None:
         """Get the current prompt"""
         return self._prompt
 
@@ -128,13 +130,14 @@ class Module(ABC, Generic[InputT, OutputT]):
 @dataclass
 class EvaluationResult:
     """Result of module evaluation"""
+
     module_type: ModuleType
-    metrics: Dict[str, float]
-    input_data: Dict[str, Any]
-    output_data: Dict[str, Any]
+    metrics: dict[str, float]
+    input_data: dict[str, Any]
+    output_data: dict[str, Any]
     prompt_version: str = "baseline"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["module_type"] = self.module_type.value
         return result
@@ -149,7 +152,7 @@ class ModuleEvaluator(ABC):
         module: Module,
         input_data: ModuleInput,
         output_data: ModuleOutput,
-        ground_truth: Optional[Any] = None
+        ground_truth: Any | None = None,
     ) -> EvaluationResult:
         """
         Evaluate module output against ground truth.
@@ -170,53 +173,61 @@ class ModuleEvaluator(ABC):
 # Module-Specific Input/Output Types
 # ============================================================================
 
+
 @dataclass
 class QueryPlannerInput(ModuleInput):
     """Input for Query Planner module"""
+
     query: str
 
 
 @dataclass
 class QueryPlannerOutput(ModuleOutput):
     """Output from Query Planner module"""
+
     mode: str = "reformulation"  # "decomposition" or "reformulation"
-    queries: List[str] = field(default_factory=list)
+    queries: list[str] = field(default_factory=list)
     original_query: str = ""
 
 
 @dataclass
 class RetrievalInput(ModuleInput):
     """Input for Retrieval module"""
-    queries: List[str]  # From query planner
+
+    queries: list[str]  # From query planner
     top_k: int = 20
 
 
 @dataclass
 class RetrievalOutput(ModuleOutput):
     """Output from Retrieval module"""
-    documents: List[Dict[str, Any]] = field(default_factory=list)
-    document_texts: List[str] = field(default_factory=list)
-    chunk_indices: List[int] = field(default_factory=list)
-    retrieved_doc_ids: List[str] = field(default_factory=list)  # For document-level evaluation
+
+    documents: list[dict[str, Any]] = field(default_factory=list)
+    document_texts: list[str] = field(default_factory=list)
+    chunk_indices: list[int] = field(default_factory=list)
+    retrieved_doc_ids: list[str] = field(default_factory=list)  # For document-level evaluation
 
 
 @dataclass
 class RerankerInput(ModuleInput):
     """Input for Reranker module"""
+
     query: str
-    documents: List[str]  # Document texts to rerank
+    documents: list[str]  # Document texts to rerank
 
 
 @dataclass
 class RerankerOutput(ModuleOutput):
     """Output from Reranker module"""
-    ranked_documents: List[str] = field(default_factory=list)
-    scores: List[float] = field(default_factory=list)
+
+    ranked_documents: list[str] = field(default_factory=list)
+    scores: list[float] = field(default_factory=list)
 
 
 @dataclass
 class GeneratorInput(ModuleInput):
     """Input for Generator module"""
+
     query: str
     context: str  # Concatenated relevant documents
 
@@ -224,6 +235,7 @@ class GeneratorInput(ModuleInput):
 @dataclass
 class GeneratorOutput(ModuleOutput):
     """Output from Generator module"""
+
     answer: str = ""
     reference: str = ""
     rationale: str = ""
@@ -233,9 +245,11 @@ class GeneratorOutput(ModuleOutput):
 # Pipeline Configuration
 # ============================================================================
 
+
 @dataclass
 class PipelineConfig:
     """Configuration for the RAG pipeline"""
+
     # Model settings
     llm_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
@@ -252,7 +266,7 @@ class PipelineConfig:
     # Prompt paths
     prompt_dir: Path = field(default_factory=lambda: Path("modules"))
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["prompt_dir"] = str(self.prompt_dir)
         return result

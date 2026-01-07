@@ -22,24 +22,25 @@ Usage:
     python run_research_experiment_v2.py --experiment_name "paper_exp_002" --n_queries 100
 """
 
-import asyncio
 import argparse
-import json
-import os
-import sys
+import asyncio
 import csv
 import hashlib
+import json
+import math
+import os
 import pickle
 import random
-import time
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Callable
-from dataclasses import dataclass, field, asdict
-from collections import defaultdict
 import statistics
-import math
+import sys
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from functools import wraps
+from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm_asyncio
 
@@ -47,26 +48,28 @@ from tqdm.asyncio import tqdm_asyncio
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Import modules
-from modules.preprocessor import DocumentPreprocessor
-from modules.query_planner.planner import QueryPlannerModule
-from modules.query_planner.retrieval import HybridRetriever
-from modules.reranker.reranker import RerankerModule
-from modules.generator.generator import GeneratorModule
-from modules.evaluation import RAGASEvaluator
-from modules.base import QueryPlannerInput, RetrievalInput, RerankerInput, GeneratorInput
+from gepa_adapters.base import GEPA_AVAILABLE, RAGDataInst
+from gepa_adapters.generator_adapter import GeneratorAdapter
 
 # Import GEPA adapters
 from gepa_adapters.query_planner_adapter import QueryPlannerAdapter
 from gepa_adapters.reranker_adapter import RerankerAdapter
-from gepa_adapters.generator_adapter import GeneratorAdapter
-from gepa_adapters.base import RAGDataInst, GEPA_AVAILABLE
-
+from modules.base import GeneratorInput, QueryPlannerInput, RerankerInput, RetrievalInput
+from modules.evaluation import RAGASEvaluator
+from modules.generator.generator import GeneratorModule
+from modules.preprocessor import DocumentPreprocessor
+from modules.query_planner.planner import QueryPlannerModule
+from modules.query_planner.retrieval import HybridRetriever
+from modules.reranker.reranker import RerankerModule
 
 # =============================================================================
 # Statistical Utilities
 # =============================================================================
 
-def compute_confidence_interval(scores: List[float], confidence: float = 0.95) -> Tuple[float, float, float]:
+
+def compute_confidence_interval(
+    scores: list[float], confidence: float = 0.95
+) -> tuple[float, float, float]:
     """
     Compute mean and confidence interval.
 
@@ -96,7 +99,7 @@ def compute_confidence_interval(scores: List[float], confidence: float = 0.95) -
     return mean, mean - margin, mean + margin
 
 
-def paired_ttest(scores1: List[float], scores2: List[float]) -> Tuple[float, float]:
+def paired_ttest(scores1: list[float], scores2: list[float]) -> tuple[float, float]:
     """
     Compute paired t-test for significance.
 
@@ -113,7 +116,7 @@ def paired_ttest(scores1: List[float], scores2: List[float]) -> Tuple[float, flo
     std_diff = statistics.stdev(diffs)
 
     if std_diff == 0:
-        return float('inf') if mean_diff != 0 else 0.0, 0.0 if mean_diff != 0 else 1.0
+        return float("inf") if mean_diff != 0 else 0.0, 0.0 if mean_diff != 0 else 1.0
 
     t_stat = mean_diff / (std_diff / math.sqrt(n))
 
@@ -128,6 +131,7 @@ def paired_ttest(scores1: List[float], scores2: List[float]) -> Tuple[float, flo
 # Retry Decorator
 # =============================================================================
 
+
 def retry_with_backoff(
     max_retries: int = 5,
     base_delay: float = 1.0,
@@ -135,6 +139,7 @@ def retry_with_backoff(
     exponential_base: float = 2.0,
 ):
     """Decorator for retrying async functions with exponential backoff."""
+
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -146,11 +151,15 @@ def retry_with_backoff(
                     last_exception = e
                     if attempt == max_retries:
                         raise
-                    delay = min(base_delay * (exponential_base ** attempt), max_delay)
-                    print(f"  [RETRY] Attempt {attempt + 1}/{max_retries} failed, waiting {delay:.1f}s...")
+                    delay = min(base_delay * (exponential_base**attempt), max_delay)
+                    print(
+                        f"  [RETRY] Attempt {attempt + 1}/{max_retries} failed, waiting {delay:.1f}s..."
+                    )
                     await asyncio.sleep(delay)
             raise last_exception
+
         return wrapper
+
     return decorator
 
 
@@ -158,21 +167,24 @@ def retry_with_backoff(
 # Data Classes for Research Paper Quality
 # =============================================================================
 
+
 @dataclass
 class PerExampleResult:
     """Track per-example results for statistical analysis."""
+
     query_id: str
     query: str
     ground_truth: str
     score: float
-    metrics: Dict[str, float]
+    metrics: dict[str, float]
     answer: str = ""
-    contexts: List[str] = field(default_factory=list)
+    contexts: list[str] = field(default_factory=list)
 
 
 @dataclass
 class GEPAIterationRecord:
     """Record for a single GEPA iteration."""
+
     iteration: int
     timestamp: str
     prompt_hash: str
@@ -182,12 +194,13 @@ class GEPAIterationRecord:
     accepted: bool
     reflection: str = ""
     feedback_summary: str = ""
-    metrics: Dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class ModuleOptimizationRecord:
     """Comprehensive record for module optimization."""
+
     module_name: str
     component_name: str
 
@@ -204,12 +217,12 @@ class ModuleOptimizationRecord:
     baseline_score: float
     baseline_ci_lower: float
     baseline_ci_upper: float
-    baseline_per_example: List[float]
+    baseline_per_example: list[float]
 
     best_score: float
     best_ci_lower: float
     best_ci_upper: float
-    best_per_example: List[float]
+    best_per_example: list[float]
 
     # Improvement with significance
     improvement_abs: float
@@ -221,7 +234,7 @@ class ModuleOptimizationRecord:
     # GEPA tracking
     total_iterations: int
     accepted_iterations: int
-    iteration_history: List[GEPAIterationRecord] = field(default_factory=list)
+    iteration_history: list[GEPAIterationRecord] = field(default_factory=list)
 
     # Cost tracking
     llm_calls: int = 0
@@ -229,15 +242,16 @@ class ModuleOptimizationRecord:
     # Baseline check result
     gepa_reverted_to_baseline: bool = False  # True if GEPA's best was worse than baseline
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
-        result['iteration_history'] = [asdict(r) for r in self.iteration_history]
+        result["iteration_history"] = [asdict(r) for r in self.iteration_history]
         return result
 
 
 @dataclass
 class EvaluationRecord:
     """Record for an evaluation run."""
+
     description: str
     split: str  # "train", "val", "test"
     timestamp: str
@@ -250,21 +264,22 @@ class EvaluationRecord:
     ci_upper: float
 
     # Per-example
-    per_example_scores: List[float]
-    per_example_results: List[PerExampleResult] = field(default_factory=list)
+    per_example_scores: list[float]
+    per_example_results: list[PerExampleResult] = field(default_factory=list)
 
     # Detailed metrics
-    metrics: Dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
-        result['per_example_results'] = [asdict(r) for r in self.per_example_results]
+        result["per_example_results"] = [asdict(r) for r in self.per_example_results]
         return result
 
 
 @dataclass
 class PhaseCheckpoint:
     """Checkpoint with research-quality tracking."""
+
     phase: int
     timestamp: str
     completed: bool = False
@@ -274,42 +289,43 @@ class PhaseCheckpoint:
     random_seed: int = 42
 
     # Data splits (query IDs)
-    train_query_ids: List[str] = field(default_factory=list)
-    val_query_ids: List[str] = field(default_factory=list)
-    test_query_ids: List[str] = field(default_factory=list)
+    train_query_ids: list[str] = field(default_factory=list)
+    val_query_ids: list[str] = field(default_factory=list)
+    test_query_ids: list[str] = field(default_factory=list)
 
     # Prompts
-    prompts: Dict[str, str] = field(default_factory=dict)
+    prompts: dict[str, str] = field(default_factory=dict)
 
     # Contexts
-    retrieved_contexts: Dict[str, List[str]] = field(default_factory=dict)
-    reranked_contexts: Dict[str, List[str]] = field(default_factory=dict)
+    retrieved_contexts: dict[str, list[str]] = field(default_factory=dict)
+    reranked_contexts: dict[str, list[str]] = field(default_factory=dict)
 
     # Module results with full tracking
-    module_results: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    module_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Evaluation records
-    evaluations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    evaluations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PhaseCheckpoint":
+    def from_dict(cls, data: dict[str, Any]) -> "PhaseCheckpoint":
         return cls(**data)
 
 
 @dataclass
 class AblationResult:
     """Ablation result with statistical rigor."""
+
     config_name: str
-    prompts_used: Dict[str, str]
+    prompts_used: dict[str, str]
 
     # Test set evaluation
     test_score: float
     test_ci_lower: float
     test_ci_upper: float
-    test_per_example: List[float]
+    test_per_example: list[float]
 
     # Comparison to baseline
     improvement_vs_baseline: float
@@ -317,15 +333,16 @@ class AblationResult:
     p_value: float
     is_significant: bool
 
-    metrics: Dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 # =============================================================================
 # Research Paper Quality Experiment Runner
 # =============================================================================
+
 
 class ResearchExperimentRunner:
     """
@@ -378,7 +395,7 @@ class ResearchExperimentRunner:
 
         # Concurrency control for parallel API calls
         self.max_concurrent = max_concurrent
-        self._semaphore: Optional[asyncio.Semaphore] = None  # Initialized lazily
+        self._semaphore: asyncio.Semaphore | None = None  # Initialized lazily
 
         # Set random seeds for reproducibility
         random.seed(random_seed)
@@ -391,44 +408,47 @@ class ResearchExperimentRunner:
         self._setup_directories()
 
         # Data storage
-        self.documents: List[Dict] = []
-        self.all_queries: List[Dict] = []
-        self.train_queries: List[Dict] = []
-        self.val_queries: List[Dict] = []
-        self.test_queries: List[Dict] = []
-        self.chunk_labels: Dict[str, List[int]] = {}
+        self.documents: list[dict] = []
+        self.all_queries: list[dict] = []
+        self.train_queries: list[dict] = []
+        self.val_queries: list[dict] = []
+        self.test_queries: list[dict] = []
+        self.chunk_labels: dict[str, list[int]] = {}
 
         # Module instances
-        self.preprocessor: Optional[DocumentPreprocessor] = None
-        self.query_planner: Optional[QueryPlannerModule] = None
-        self.retriever: Optional[HybridRetriever] = None
-        self.reranker: Optional[RerankerModule] = None
-        self.generator: Optional[GeneratorModule] = None
-        self.evaluator: Optional[RAGASEvaluator] = None
+        self.preprocessor: DocumentPreprocessor | None = None
+        self.query_planner: QueryPlannerModule | None = None
+        self.retriever: HybridRetriever | None = None
+        self.reranker: RerankerModule | None = None
+        self.generator: GeneratorModule | None = None
+        self.evaluator: RAGASEvaluator | None = None
 
         # RRF Weight Optimization Results
         self.optimal_rrf_weight: float = 0.5
-        self.rrf_weight_scores: Dict[float, Dict[str, float]] = {}
+        self.rrf_weight_scores: dict[float, dict[str, float]] = {}
 
         # Results
-        self.ablation_results: List[AblationResult] = []
-        self.baseline_test_scores: List[float] = []  # For paired t-test
+        self.ablation_results: list[AblationResult] = []
+        self.baseline_test_scores: list[float] = []  # For paired t-test
 
     def _generate_config_hash(self) -> str:
         """Generate hash of configuration for reproducibility."""
-        config_str = json.dumps({
-            "n_queries": self.n_queries,
-            "optimization_budget": self.optimization_budget,
-            "model": self.model,
-            "chunk_size": self.chunk_size,
-            "chunk_overlap": self.chunk_overlap,
-            "retrieval_k": self.retrieval_k,
-            "rerank_k": self.rerank_k,
-            "random_seed": self.random_seed,
-            "train_ratio": self.train_ratio,
-            "val_ratio": self.val_ratio,
-            "test_ratio": self.test_ratio,
-        }, sort_keys=True)
+        config_str = json.dumps(
+            {
+                "n_queries": self.n_queries,
+                "optimization_budget": self.optimization_budget,
+                "model": self.model,
+                "chunk_size": self.chunk_size,
+                "chunk_overlap": self.chunk_overlap,
+                "retrieval_k": self.retrieval_k,
+                "rerank_k": self.rerank_k,
+                "random_seed": self.random_seed,
+                "train_ratio": self.train_ratio,
+                "val_ratio": self.val_ratio,
+                "test_ratio": self.test_ratio,
+            },
+            sort_keys=True,
+        )
         return hashlib.sha256(config_str.encode()).hexdigest()
 
     def _setup_directories(self):
@@ -470,7 +490,7 @@ class ResearchExperimentRunner:
         print(f"  [CHECKPOINT] Saved Phase {phase}")
         return json_path
 
-    def load_checkpoint(self, phase: int) -> Optional[PhaseCheckpoint]:
+    def load_checkpoint(self, phase: int) -> PhaseCheckpoint | None:
         pickle_path = self.checkpoint_dir / f"checkpoint_phase_{phase}.pkl"
         if pickle_path.exists():
             with open(pickle_path, "rb") as f:
@@ -478,7 +498,7 @@ class ResearchExperimentRunner:
 
             # Verify config hash
             if checkpoint.config_hash != self.config_hash:
-                print(f"  [WARNING] Config hash mismatch! Checkpoint may be from different config.")
+                print("  [WARNING] Config hash mismatch! Checkpoint may be from different config.")
 
             return checkpoint
         return None
@@ -488,9 +508,15 @@ class ResearchExperimentRunner:
         # Restore data splits
         if checkpoint.train_query_ids:
             query_map = {q["query_id"]: q for q in self.all_queries}
-            self.train_queries = [query_map[qid] for qid in checkpoint.train_query_ids if qid in query_map]
-            self.val_queries = [query_map[qid] for qid in checkpoint.val_query_ids if qid in query_map]
-            self.test_queries = [query_map[qid] for qid in checkpoint.test_query_ids if qid in query_map]
+            self.train_queries = [
+                query_map[qid] for qid in checkpoint.train_query_ids if qid in query_map
+            ]
+            self.val_queries = [
+                query_map[qid] for qid in checkpoint.val_query_ids if qid in query_map
+            ]
+            self.test_queries = [
+                query_map[qid] for qid in checkpoint.test_query_ids if qid in query_map
+            ]
 
         # Restore prompts
         if self.query_planner and "query_planner" in checkpoint.prompts:
@@ -508,9 +534,9 @@ class ResearchExperimentRunner:
 
     async def load_and_split_data(self, data_path: Path):
         """Load data and create proper train/val/test splits."""
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("  LOADING & SPLITTING DATA")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         # Load documents
         docs_path = data_path / "documents.json"
@@ -523,7 +549,7 @@ class ResearchExperimentRunner:
             all_queries = json.load(f)
 
         # Select queries
-        self.all_queries = all_queries[:self.n_queries]
+        self.all_queries = all_queries[: self.n_queries]
 
         # Shuffle with seed for reproducibility
         shuffled = self.all_queries.copy()
@@ -535,8 +561,8 @@ class ResearchExperimentRunner:
         n_val = int(n_total * self.val_ratio)
 
         self.train_queries = shuffled[:n_train]
-        self.val_queries = shuffled[n_train:n_train + n_val]
-        self.test_queries = shuffled[n_train + n_val:]
+        self.val_queries = shuffled[n_train : n_train + n_val]
+        self.test_queries = shuffled[n_train + n_val :]
 
         # Get relevant documents
         relevant_doc_ids = set()
@@ -546,17 +572,17 @@ class ResearchExperimentRunner:
         self.documents = [d for d in all_documents if d["doc_id"] in relevant_doc_ids]
 
         print(f"  Total queries: {n_total}")
-        print(f"  Train: {len(self.train_queries)} ({self.train_ratio*100:.0f}%)")
-        print(f"  Val: {len(self.val_queries)} ({self.val_ratio*100:.0f}%)")
-        print(f"  Test: {len(self.test_queries)} ({self.test_ratio*100:.0f}%) [HELD OUT]")
+        print(f"  Train: {len(self.train_queries)} ({self.train_ratio * 100:.0f}%)")
+        print(f"  Val: {len(self.val_queries)} ({self.val_ratio * 100:.0f}%)")
+        print(f"  Test: {len(self.test_queries)} ({self.test_ratio * 100:.0f}%) [HELD OUT]")
         print(f"  Documents: {len(self.documents)}")
         print(f"  Config hash: {self.config_hash[:16]}...")
 
     async def setup_pipeline(self):
         """Initialize pipeline components with optimized settings."""
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("  SETTING UP PIPELINE (Optimized)")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         # Preprocessor with optimized embedding settings
         self.preprocessor = DocumentPreprocessor(
@@ -593,9 +619,9 @@ class ResearchExperimentRunner:
 
     async def _optimize_rrf_weight(self):
         """Find and set optimal RRF weight using training data."""
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("  OPTIMIZING RRF WEIGHT")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         # Use only training queries to find optimal weight
         optimal_weight, weight_scores = await self.retriever.find_optimal_weight(
@@ -626,19 +652,21 @@ class ResearchExperimentRunner:
     # -------------------------------------------------------------------------
 
     @retry_with_backoff(max_retries=5, base_delay=2.0)
-    async def _run_query_planner_single(self, query: str) -> List[str]:
+    async def _run_query_planner_single(self, query: str) -> list[str]:
         output = await self.query_planner.run(QueryPlannerInput(query=query))
         return output.queries
 
     @retry_with_backoff(max_retries=5, base_delay=2.0)
-    async def _run_retrieval_single(self, queries: List[str], top_k: int) -> Tuple[List[str], List[int]]:
+    async def _run_retrieval_single(
+        self, queries: list[str], top_k: int
+    ) -> tuple[list[str], list[int]]:
         output = await self.retriever.run(RetrievalInput(queries=queries, top_k=top_k))
         return output.document_texts, output.chunk_indices
 
     @retry_with_backoff(max_retries=5, base_delay=2.0)
-    async def _run_reranker_single(self, query: str, documents: List[str]) -> List[str]:
+    async def _run_reranker_single(self, query: str, documents: list[str]) -> list[str]:
         output = await self.reranker.run(RerankerInput(query=query, documents=documents))
-        return output.ranked_documents[:self.rerank_k]
+        return output.ranked_documents[: self.rerank_k]
 
     @retry_with_backoff(max_retries=5, base_delay=2.0)
     async def _run_generator_single(self, query: str, context: str) -> str:
@@ -647,8 +675,8 @@ class ResearchExperimentRunner:
 
     async def _process_single_query_context(
         self,
-        q: Dict,
-    ) -> Tuple[str, List[str], List[str], Optional[str]]:
+        q: dict,
+    ) -> tuple[str, list[str], list[str], str | None]:
         """Process a single query through planning, retrieval, and reranking."""
         qid = q["query_id"]
         query_text = q["query"]
@@ -664,11 +692,13 @@ class ResearchExperimentRunner:
 
     async def generate_contexts_for_split(
         self,
-        queries: List[Dict],
+        queries: list[dict],
         description: str = "",
-    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         """Generate contexts for a specific data split with parallel processing."""
-        print(f"\n  Generating contexts ({description}, n={len(queries)}, concurrency={self.max_concurrent})...")
+        print(
+            f"\n  Generating contexts ({description}, n={len(queries)}, concurrency={self.max_concurrent})..."
+        )
 
         # Create tasks for all queries
         tasks = [self._process_single_query_context(q) for q in queries]
@@ -676,13 +706,13 @@ class ResearchExperimentRunner:
         # Run all tasks concurrently with progress bar
         results = await tqdm_asyncio.gather(
             *tasks,
-            desc=f"    Processing queries",
+            desc="    Processing queries",
             total=len(tasks),
         )
 
         # Collect results
-        retrieved_contexts: Dict[str, List[str]] = {}
-        reranked_contexts: Dict[str, List[str]] = {}
+        retrieved_contexts: dict[str, list[str]] = {}
+        reranked_contexts: dict[str, list[str]] = {}
         errors = 0
 
         for qid, retrieved, reranked, error in results:
@@ -703,9 +733,9 @@ class ResearchExperimentRunner:
 
     async def _evaluate_single_query(
         self,
-        q: Dict,
-        contexts: List[str],
-    ) -> Optional[PerExampleResult]:
+        q: dict,
+        contexts: list[str],
+    ) -> PerExampleResult | None:
         """Evaluate a single query with generation and RAGAS metrics."""
         qid = q["query_id"]
         query_text = q["query"]
@@ -746,8 +776,8 @@ class ResearchExperimentRunner:
 
     async def evaluate_split(
         self,
-        queries: List[Dict],
-        reranked_contexts: Dict[str, List[str]],
+        queries: list[dict],
+        reranked_contexts: dict[str, list[str]],
         description: str,
         split: str,
     ) -> EvaluationRecord:
@@ -763,14 +793,14 @@ class ResearchExperimentRunner:
         # Run all tasks concurrently
         results = await tqdm_asyncio.gather(
             *tasks,
-            desc=f"    Evaluating queries",
+            desc="    Evaluating queries",
             total=len(tasks),
         )
 
         # Collect results
-        per_example_results: List[PerExampleResult] = [r for r in results if r is not None]
-        all_scores: List[float] = [r.score for r in per_example_results]
-        all_metrics: Dict[str, List[float]] = defaultdict(list)
+        per_example_results: list[PerExampleResult] = [r for r in results if r is not None]
+        all_scores: list[float] = [r.score for r in per_example_results]
+        all_metrics: dict[str, list[float]] = defaultdict(list)
 
         for r in per_example_results:
             for k, v in r.metrics.items():
@@ -815,13 +845,13 @@ class ResearchExperimentRunner:
         self,
         module_name: str,
         adapter,
-        train_data: List[RAGDataInst],
-        val_data: List[RAGDataInst],
+        train_data: list[RAGDataInst],
+        val_data: list[RAGDataInst],
     ) -> ModuleOptimizationRecord:
         """Optimize module with comprehensive tracking."""
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"  OPTIMIZING: {module_name.upper()}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         print(f"  Train examples: {len(train_data)}")
         print(f"  Val examples: {len(val_data)}")
 
@@ -835,15 +865,19 @@ class ResearchExperimentRunner:
         self._save_prompt(module_name, seed_prompt, "seed")
 
         # Baseline evaluation
-        print(f"\n  Baseline evaluation on validation set...")
+        print("\n  Baseline evaluation on validation set...")
         baseline_batch = await self._evaluate_with_retry(adapter, val_data, seed_candidate)
         baseline_scores = baseline_batch.scores
-        baseline_mean, baseline_ci_lower, baseline_ci_upper = compute_confidence_interval(baseline_scores)
+        baseline_mean, baseline_ci_lower, baseline_ci_upper = compute_confidence_interval(
+            baseline_scores
+        )
 
-        print(f"  Baseline: {baseline_mean:.4f} (95% CI: [{baseline_ci_lower:.4f}, {baseline_ci_upper:.4f}])")
+        print(
+            f"  Baseline: {baseline_mean:.4f} (95% CI: [{baseline_ci_lower:.4f}, {baseline_ci_upper:.4f}])"
+        )
 
         # Run optimization
-        iteration_history: List[GEPAIterationRecord] = []
+        iteration_history: list[GEPAIterationRecord] = []
         best_prompt = seed_prompt
         best_scores = baseline_scores
         best_mean = baseline_mean
@@ -877,13 +911,18 @@ class ResearchExperimentRunner:
             except Exception as e:
                 print(f"  [ERROR] GEPA optimization failed: {e}")
                 import traceback
+
                 traceback.print_exc()
         else:
-            print(f"  [SIMULATION] GEPA not available")
+            print("  [SIMULATION] GEPA not available")
 
         # Apply best prompt
         adapter.module._prompt = best_prompt
-        self._save_prompt(module_name, best_prompt, "best" if not gepa_reverted_to_baseline else "best_reverted_to_seed")
+        self._save_prompt(
+            module_name,
+            best_prompt,
+            "best" if not gepa_reverted_to_baseline else "best_reverted_to_seed",
+        )
 
         # Compute stats
         best_ci_lower, best_ci_upper = compute_confidence_interval(best_scores)[1:]
@@ -929,25 +968,25 @@ class ResearchExperimentRunner:
         for attempt in range(max_retries):
             try:
                 return await adapter._evaluate_async(data, candidate, capture_traces=True)
-            except Exception as e:
+            except Exception:
                 if attempt == max_retries - 1:
                     raise
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
 
     async def _run_gepa_with_tracking(
         self,
         adapter,
-        train_data: List[RAGDataInst],
-        val_data: List[RAGDataInst],
+        train_data: list[RAGDataInst],
+        val_data: list[RAGDataInst],
         module_name: str,
-    ) -> Tuple[str, List[float], List[GEPAIterationRecord]]:
+    ) -> tuple[str, list[float], list[GEPAIterationRecord]]:
         """Run GEPA optimization with iteration tracking."""
         from gepa import optimize
 
         print(f"  Running GEPA optimization (budget={self.optimization_budget})...")
 
         seed_candidate = adapter.get_candidate()
-        iteration_history: List[GEPAIterationRecord] = []
+        iteration_history: list[GEPAIterationRecord] = []
 
         gepa_result = optimize(
             seed_candidate=seed_candidate,
@@ -958,16 +997,20 @@ class ResearchExperimentRunner:
             reflection_lm=f"openai/{self.model}",
         )
 
-        best_candidate = getattr(gepa_result, 'best_candidate', {})
-        best_prompt = best_candidate.get(adapter.component_name, "") if isinstance(best_candidate, dict) else ""
+        best_candidate = getattr(gepa_result, "best_candidate", {})
+        best_prompt = (
+            best_candidate.get(adapter.component_name, "")
+            if isinstance(best_candidate, dict)
+            else ""
+        )
 
         # Evaluate best prompt
         best_batch = await adapter._evaluate_async(val_data, best_candidate, capture_traces=False)
         best_scores = best_batch.scores
 
         # Try to extract iteration history
-        candidates = getattr(gepa_result, 'candidates', [])
-        val_scores = getattr(gepa_result, 'val_aggregate_scores', [])
+        candidates = getattr(gepa_result, "candidates", [])
+        val_scores = getattr(gepa_result, "val_aggregate_scores", [])
 
         for i, (cand, score) in enumerate(zip(candidates, val_scores)):
             prompt_text = cand.get(adapter.component_name, "") if isinstance(cand, dict) else ""
@@ -978,10 +1021,10 @@ class ResearchExperimentRunner:
                 prompt_text=prompt_text,
                 train_score=0.0,
                 val_score=score,
-                accepted=i == getattr(gepa_result, 'best_idx', 0),
+                accepted=i == getattr(gepa_result, "best_idx", 0),
             )
             iteration_history.append(record)
-            self._save_prompt(module_name, prompt_text, f"iter_{i+1:03d}")
+            self._save_prompt(module_name, prompt_text, f"iter_{i + 1:03d}")
 
         return best_prompt, best_scores, iteration_history
 
@@ -997,9 +1040,9 @@ class ResearchExperimentRunner:
 
     async def phase_0_baseline(self) -> PhaseCheckpoint:
         """Phase 0: Data split and baseline capture."""
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("  PHASE 0: DATA SPLIT & BASELINE CAPTURE")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         checkpoint = PhaseCheckpoint(
             phase=0,
@@ -1022,9 +1065,7 @@ class ResearchExperimentRunner:
         checkpoint.retrieved_contexts = retrieved
         checkpoint.reranked_contexts = reranked
 
-        val_eval = await self.evaluate_split(
-            self.val_queries, reranked, "baseline", "val"
-        )
+        val_eval = await self.evaluate_split(self.val_queries, reranked, "baseline", "val")
         checkpoint.evaluations["baseline_val"] = val_eval.to_dict()
 
         self.save_checkpoint(0, checkpoint)
@@ -1032,9 +1073,9 @@ class ResearchExperimentRunner:
 
     async def phase_1_query_planner(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 1: Optimize Query Planner."""
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("  PHASE 1: QUERY PLANNER OPTIMIZATION")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         checkpoint = PhaseCheckpoint(
             phase=1,
@@ -1051,23 +1092,27 @@ class ResearchExperimentRunner:
         # Prepare train/val data
         train_data = []
         for q in self.train_queries:
-            train_data.append({
-                "query": q["query"],
-                "ground_truth": q.get("ground_truth", ""),
-                "relevant_chunk_indices": self.chunk_labels.get(q["query_id"], []),
-                "contexts": None,
-                "metadata": {"query_id": q["query_id"]},
-            })
+            train_data.append(
+                {
+                    "query": q["query"],
+                    "ground_truth": q.get("ground_truth", ""),
+                    "relevant_chunk_indices": self.chunk_labels.get(q["query_id"], []),
+                    "contexts": None,
+                    "metadata": {"query_id": q["query_id"]},
+                }
+            )
 
         val_data = []
         for q in self.val_queries:
-            val_data.append({
-                "query": q["query"],
-                "ground_truth": q.get("ground_truth", ""),
-                "relevant_chunk_indices": self.chunk_labels.get(q["query_id"], []),
-                "contexts": None,
-                "metadata": {"query_id": q["query_id"]},
-            })
+            val_data.append(
+                {
+                    "query": q["query"],
+                    "ground_truth": q.get("ground_truth", ""),
+                    "relevant_chunk_indices": self.chunk_labels.get(q["query_id"], []),
+                    "contexts": None,
+                    "metadata": {"query_id": q["query_id"]},
+                }
+            )
 
         # Optimize
         adapter = QueryPlannerAdapter(
@@ -1081,7 +1126,7 @@ class ResearchExperimentRunner:
         checkpoint.prompts["query_planner"] = result.best_prompt
 
         # Regenerate contexts with optimized M1
-        print(f"\n  [CASCADE] Regenerating contexts with optimized M1...")
+        print("\n  [CASCADE] Regenerating contexts with optimized M1...")
         train_val_queries = self.train_queries + self.val_queries
         new_retrieved, new_reranked = await self.generate_contexts_for_split(
             train_val_queries, "post_m1_optimization"
@@ -1094,9 +1139,9 @@ class ResearchExperimentRunner:
 
     async def phase_2_reranker(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 2: Optimize Reranker."""
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("  PHASE 2: RERANKER OPTIMIZATION")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         checkpoint = PhaseCheckpoint(
             phase=2,
@@ -1119,7 +1164,7 @@ class ResearchExperimentRunner:
             if chunk_text and chunk_text not in chunk_text_to_idx:
                 chunk_text_to_idx[chunk_text] = idx
 
-        def get_chunk_indices(docs: List[str]) -> List[int]:
+        def get_chunk_indices(docs: list[str]) -> list[int]:
             indices = []
             for doc in docs:
                 doc_key = doc[:200] if doc else ""
@@ -1133,28 +1178,32 @@ class ResearchExperimentRunner:
             qid = q["query_id"]
             contexts = prev_checkpoint.retrieved_contexts.get(qid, [])
             if contexts:
-                train_data.append({
-                    "query": q["query"],
-                    "ground_truth": q.get("ground_truth", ""),
-                    "relevant_chunk_indices": self.chunk_labels.get(qid, []),
-                    "contexts": contexts,
-                    "context_chunk_indices": get_chunk_indices(contexts),
-                    "metadata": {"query_id": qid},
-                })
+                train_data.append(
+                    {
+                        "query": q["query"],
+                        "ground_truth": q.get("ground_truth", ""),
+                        "relevant_chunk_indices": self.chunk_labels.get(qid, []),
+                        "contexts": contexts,
+                        "context_chunk_indices": get_chunk_indices(contexts),
+                        "metadata": {"query_id": qid},
+                    }
+                )
 
         val_data = []
         for q in self.val_queries:
             qid = q["query_id"]
             contexts = prev_checkpoint.retrieved_contexts.get(qid, [])
             if contexts:
-                val_data.append({
-                    "query": q["query"],
-                    "ground_truth": q.get("ground_truth", ""),
-                    "relevant_chunk_indices": self.chunk_labels.get(qid, []),
-                    "contexts": contexts,
-                    "context_chunk_indices": get_chunk_indices(contexts),
-                    "metadata": {"query_id": qid},
-                })
+                val_data.append(
+                    {
+                        "query": q["query"],
+                        "ground_truth": q.get("ground_truth", ""),
+                        "relevant_chunk_indices": self.chunk_labels.get(qid, []),
+                        "contexts": contexts,
+                        "context_chunk_indices": get_chunk_indices(contexts),
+                        "metadata": {"query_id": qid},
+                    }
+                )
 
         # Optimize
         adapter = RerankerAdapter(
@@ -1168,9 +1217,9 @@ class ResearchExperimentRunner:
         checkpoint.prompts["reranker"] = result.best_prompt
 
         # Regenerate reranked contexts with optimized M2
-        print(f"\n  [CASCADE] Regenerating reranked contexts with optimized M2...")
+        print("\n  [CASCADE] Regenerating reranked contexts with optimized M2...")
 
-        async def rerank_single(q: Dict, docs: List[str]) -> Tuple[str, List[str]]:
+        async def rerank_single(q: dict, docs: list[str]) -> tuple[str, list[str]]:
             qid = q["query_id"]
             if not docs:
                 return (qid, [])
@@ -1179,7 +1228,7 @@ class ResearchExperimentRunner:
                     ranked = await self._run_reranker_single(q["query"], docs)
                     return (qid, ranked)
                 except Exception:
-                    return (qid, docs[:self.rerank_k])
+                    return (qid, docs[: self.rerank_k])
 
         queries = self.train_queries + self.val_queries
         tasks = [
@@ -1196,9 +1245,9 @@ class ResearchExperimentRunner:
 
     async def phase_3_generator(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 3: Optimize Generator."""
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("  PHASE 3: GENERATOR OPTIMIZATION")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         checkpoint = PhaseCheckpoint(
             phase=3,
@@ -1219,26 +1268,30 @@ class ResearchExperimentRunner:
             qid = q["query_id"]
             contexts = prev_checkpoint.reranked_contexts.get(qid, [])
             if contexts:
-                train_data.append({
-                    "query": q["query"],
-                    "ground_truth": q.get("ground_truth", ""),
-                    "relevant_chunk_indices": None,
-                    "contexts": contexts,
-                    "metadata": {"query_id": qid},
-                })
+                train_data.append(
+                    {
+                        "query": q["query"],
+                        "ground_truth": q.get("ground_truth", ""),
+                        "relevant_chunk_indices": None,
+                        "contexts": contexts,
+                        "metadata": {"query_id": qid},
+                    }
+                )
 
         val_data = []
         for q in self.val_queries:
             qid = q["query_id"]
             contexts = prev_checkpoint.reranked_contexts.get(qid, [])
             if contexts:
-                val_data.append({
-                    "query": q["query"],
-                    "ground_truth": q.get("ground_truth", ""),
-                    "relevant_chunk_indices": None,
-                    "contexts": contexts,
-                    "metadata": {"query_id": qid},
-                })
+                val_data.append(
+                    {
+                        "query": q["query"],
+                        "ground_truth": q.get("ground_truth", ""),
+                        "relevant_chunk_indices": None,
+                        "contexts": contexts,
+                        "metadata": {"query_id": qid},
+                    }
+                )
 
         # Optimize
         adapter = GeneratorAdapter(
@@ -1255,9 +1308,9 @@ class ResearchExperimentRunner:
 
     async def phase_4_test_evaluation(self, prev_checkpoint: PhaseCheckpoint) -> PhaseCheckpoint:
         """Phase 4: Test set evaluation and ablation studies."""
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("  PHASE 4: TEST SET EVALUATION & ABLATIONS")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         checkpoint = PhaseCheckpoint(
             phase=4,
@@ -1298,11 +1351,11 @@ class ResearchExperimentRunner:
         3. Generator optimization (using optimized QP+RR contexts)
         4. Test set evaluation & ablation studies
         """
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"  EXPERIMENT: {self.experiment_name}")
         print(f"  ID: {self.experiment_id}")
         print(f"  Resume from phase: {resume_from}")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         # Load data and setup pipeline
         await self.load_and_split_data(data_path)
@@ -1316,7 +1369,9 @@ class ResearchExperimentRunner:
                 self.restore_state_from_checkpoint(checkpoint)
                 print(f"  Resuming from Phase {resume_from}")
             else:
-                print(f"  [WARNING] No checkpoint found for Phase {resume_from - 1}, starting from Phase 0")
+                print(
+                    f"  [WARNING] No checkpoint found for Phase {resume_from - 1}, starting from Phase 0"
+                )
                 resume_from = 0
 
         # Execute phases
@@ -1335,14 +1390,14 @@ class ResearchExperimentRunner:
         if resume_from <= 4:
             checkpoint = await self.phase_4_test_evaluation(checkpoint or self.load_checkpoint(3))
 
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"  EXPERIMENT COMPLETE: {self.experiment_name}")
         print(f"  Results saved to: {self.output_dir}")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
 
         return checkpoint
 
-    async def run_ablation_studies(self, checkpoint: PhaseCheckpoint) -> List[AblationResult]:
+    async def run_ablation_studies(self, checkpoint: PhaseCheckpoint) -> list[AblationResult]:
         """Run ablation studies on TEST set."""
         print(f"\n  Running ablation studies on TEST set (n={len(self.test_queries)})...")
 
@@ -1352,20 +1407,26 @@ class ResearchExperimentRunner:
 
         configs = [
             ("baseline", seed_prompts),
-            ("M1_only", {
-                "query_planner": checkpoint.prompts.get("query_planner", ""),
-                "reranker": seed_prompts.get("reranker", ""),
-                "generator": seed_prompts.get("generator", ""),
-            }),
-            ("M1+M2", {
-                "query_planner": checkpoint.prompts.get("query_planner", ""),
-                "reranker": checkpoint.prompts.get("reranker", ""),
-                "generator": seed_prompts.get("generator", ""),
-            }),
+            (
+                "M1_only",
+                {
+                    "query_planner": checkpoint.prompts.get("query_planner", ""),
+                    "reranker": seed_prompts.get("reranker", ""),
+                    "generator": seed_prompts.get("generator", ""),
+                },
+            ),
+            (
+                "M1+M2",
+                {
+                    "query_planner": checkpoint.prompts.get("query_planner", ""),
+                    "reranker": checkpoint.prompts.get("reranker", ""),
+                    "generator": seed_prompts.get("generator", ""),
+                },
+            ),
             ("M1+M2+M3", checkpoint.prompts),
         ]
 
-        baseline_scores: List[float] = []
+        baseline_scores: list[float] = []
 
         for config_name, prompts in configs:
             print(f"\n    Ablation: {config_name}")
@@ -1385,8 +1446,12 @@ class ResearchExperimentRunner:
             if config_name == "baseline":
                 baseline_scores = test_scores.copy()
 
-            improvement = eval_record.mean_score - (statistics.mean(baseline_scores) if baseline_scores else 0)
-            t_stat, p_value = paired_ttest(baseline_scores, test_scores) if baseline_scores else (0, 1)
+            improvement = eval_record.mean_score - (
+                statistics.mean(baseline_scores) if baseline_scores else 0
+            )
+            t_stat, p_value = (
+                paired_ttest(baseline_scores, test_scores) if baseline_scores else (0, 1)
+            )
 
             ablation = AblationResult(
                 config_name=config_name,
@@ -1415,9 +1480,9 @@ class ResearchExperimentRunner:
     # Report Generation
     # -------------------------------------------------------------------------
 
-    def _generate_reports(self, checkpoint: PhaseCheckpoint, ablations: List[AblationResult]):
+    def _generate_reports(self, checkpoint: PhaseCheckpoint, ablations: list[AblationResult]):
         """Generate all reports including LaTeX tables."""
-        print(f"\n  Generating reports...")
+        print("\n  Generating reports...")
 
         # Summary JSON
         summary = {
@@ -1445,50 +1510,64 @@ class ResearchExperimentRunner:
 
         print(f"  Reports saved to {self.output_dir}")
 
-    def _generate_csv_tables(self, checkpoint: PhaseCheckpoint, ablations: List[AblationResult]):
+    def _generate_csv_tables(self, checkpoint: PhaseCheckpoint, ablations: list[AblationResult]):
         """Generate CSV tables."""
         # Module results
         with open(self.output_dir / "analysis" / "module_results.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "Module", "Baseline", "Baseline CI", "Optimized", "Optimized CI",
-                "Improvement", "Improvement %", "t-stat", "p-value", "Significant"
-            ])
+            writer.writerow(
+                [
+                    "Module",
+                    "Baseline",
+                    "Baseline CI",
+                    "Optimized",
+                    "Optimized CI",
+                    "Improvement",
+                    "Improvement %",
+                    "t-stat",
+                    "p-value",
+                    "Significant",
+                ]
+            )
 
             for name in ["query_planner", "reranker", "generator"]:
                 if name in checkpoint.module_results:
                     r = checkpoint.module_results[name]
-                    writer.writerow([
-                        name,
-                        f"{r['baseline_score']:.4f}",
-                        f"[{r['baseline_ci_lower']:.4f}, {r['baseline_ci_upper']:.4f}]",
-                        f"{r['best_score']:.4f}",
-                        f"[{r['best_ci_lower']:.4f}, {r['best_ci_upper']:.4f}]",
-                        f"{r['improvement_abs']:+.4f}",
-                        f"{r['improvement_pct']:+.1f}%",
-                        f"{r['t_statistic']:.3f}",
-                        f"{r['p_value']:.4f}",
-                        "Yes" if r['is_significant'] else "No",
-                    ])
+                    writer.writerow(
+                        [
+                            name,
+                            f"{r['baseline_score']:.4f}",
+                            f"[{r['baseline_ci_lower']:.4f}, {r['baseline_ci_upper']:.4f}]",
+                            f"{r['best_score']:.4f}",
+                            f"[{r['best_ci_lower']:.4f}, {r['best_ci_upper']:.4f}]",
+                            f"{r['improvement_abs']:+.4f}",
+                            f"{r['improvement_pct']:+.1f}%",
+                            f"{r['t_statistic']:.3f}",
+                            f"{r['p_value']:.4f}",
+                            "Yes" if r["is_significant"] else "No",
+                        ]
+                    )
 
         # Ablation results
         with open(self.output_dir / "ablations" / "ablation_results.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "Configuration", "Test Score", "95% CI", "vs Baseline", "p-value", "Significant"
-            ])
+            writer.writerow(
+                ["Configuration", "Test Score", "95% CI", "vs Baseline", "p-value", "Significant"]
+            )
 
             for ab in ablations:
-                writer.writerow([
-                    ab.config_name,
-                    f"{ab.test_score:.4f}",
-                    f"[{ab.test_ci_lower:.4f}, {ab.test_ci_upper:.4f}]",
-                    f"{ab.improvement_vs_baseline:+.4f}",
-                    f"{ab.p_value:.4f}",
-                    "Yes" if ab.is_significant else "No",
-                ])
+                writer.writerow(
+                    [
+                        ab.config_name,
+                        f"{ab.test_score:.4f}",
+                        f"[{ab.test_ci_lower:.4f}, {ab.test_ci_upper:.4f}]",
+                        f"{ab.improvement_vs_baseline:+.4f}",
+                        f"{ab.p_value:.4f}",
+                        "Yes" if ab.is_significant else "No",
+                    ]
+                )
 
-    def _generate_latex_tables(self, checkpoint: PhaseCheckpoint, ablations: List[AblationResult]):
+    def _generate_latex_tables(self, checkpoint: PhaseCheckpoint, ablations: list[AblationResult]):
         """Generate LaTeX tables for paper."""
 
         # Table 1: Module-level optimization results
@@ -1506,7 +1585,7 @@ class ResearchExperimentRunner:
         for name in ["query_planner", "reranker", "generator"]:
             if name in checkpoint.module_results:
                 r = checkpoint.module_results[name]
-                sig = self._significance_stars(r['p_value'])
+                sig = self._significance_stars(r["p_value"])
                 display_name = name.replace("_", " ").title()
                 latex_module += f"{display_name} & "
                 latex_module += f"{r['baseline_score']:.3f} & "
@@ -1569,7 +1648,7 @@ class ResearchExperimentRunner:
 \midrule
 """
         latex_config += f"Total Queries & {self.n_queries} \\\\\n"
-        latex_config += f"Train/Val/Test Split & {int(self.train_ratio*100)}/{int(self.val_ratio*100)}/{int(self.test_ratio*100)} \\\\\n"
+        latex_config += f"Train/Val/Test Split & {int(self.train_ratio * 100)}/{int(self.val_ratio * 100)}/{int(self.test_ratio * 100)} \\\\\n"
         latex_config += f"Optimization Budget & {self.optimization_budget} \\\\\n"
         latex_config += f"LLM Model & {self.model} \\\\\n"
         latex_config += f"Retrieval $k$ & {self.retrieval_k} \\\\\n"
@@ -1588,29 +1667,33 @@ class ResearchExperimentRunner:
     def _significance_stars(self, p_value: float) -> str:
         if p_value < 0.001:
             return "$^{***}$"
-        elif p_value < 0.01:
+        if p_value < 0.01:
             return "$^{**}$"
-        elif p_value < 0.05:
+        if p_value < 0.05:
             return "$^{*}$"
         return ""
 
-    def _save_per_example_results(self, ablations: List[AblationResult]):
+    def _save_per_example_results(self, ablations: list[AblationResult]):
         """Save per-example results for analysis."""
         for ab in ablations:
             path = self.output_dir / "per_example" / f"{ab.config_name}_scores.json"
             with open(path, "w") as f:
-                json.dump({
-                    "config": ab.config_name,
-                    "scores": ab.test_per_example,
-                    "mean": ab.test_score,
-                    "ci": [ab.test_ci_lower, ab.test_ci_upper],
-                }, f, indent=2)
-
+                json.dump(
+                    {
+                        "config": ab.config_name,
+                        "scores": ab.test_per_example,
+                        "mean": ab.test_score,
+                        "ci": [ab.test_ci_lower, ab.test_ci_upper],
+                    },
+                    f,
+                    indent=2,
+                )
 
 
 # =============================================================================
 # Main Entry Point
 # =============================================================================
+
 
 async def main(args):
     load_dotenv()

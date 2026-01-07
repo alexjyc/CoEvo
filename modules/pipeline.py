@@ -5,33 +5,32 @@ Orchestrates all modules in a clean, composable way.
 Each module is independently testable and optimizable.
 """
 
-import asyncio
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any
 
 from modules.base import (
+    GeneratorInput,
     PipelineConfig,
     QueryPlannerInput,
-    RetrievalInput,
     RerankerInput,
-    GeneratorInput,
+    RetrievalInput,
 )
-from modules.query_planner import QueryPlannerModule, HybridRetriever
-from modules.reranker import RerankerModule
-from modules.generator import GeneratorModule
 from modules.evaluation import RAGASEvaluator
+from modules.generator import GeneratorModule
+from modules.query_planner import HybridRetriever, QueryPlannerModule
+from modules.reranker import RerankerModule
 
 
 @dataclass
 class PipelineResult:
     """Result from RAG pipeline execution"""
+
     answer: str
     rationale: str
-    contexts: List[str]
-    ranked_documents: List[str]
-    metrics: Dict[str, float]
-    metadata: Dict[str, Any]
+    contexts: list[str]
+    ranked_documents: list[str]
+    metrics: dict[str, float]
+    metadata: dict[str, Any]
 
 
 class ModularRAGPipeline:
@@ -54,7 +53,7 @@ class ModularRAGPipeline:
     def __init__(
         self,
         preprocessor,  # DocumentPreprocessor instance
-        config: Optional[PipelineConfig] = None,
+        config: PipelineConfig | None = None,
     ):
         self.config = config or PipelineConfig()
         self.preprocessor = preprocessor
@@ -62,7 +61,7 @@ class ModularRAGPipeline:
         # Initialize modules
         self.query_planner = QueryPlannerModule(
             model_name=self.config.llm_model,
-            prompt_path=self.config.prompt_dir / "query_planner" / "prompts" / "current.txt"
+            prompt_path=self.config.prompt_dir / "query_planner" / "prompts" / "current.txt",
         )
 
         self.retriever = HybridRetriever(
@@ -72,12 +71,12 @@ class ModularRAGPipeline:
 
         self.reranker = RerankerModule(
             model_name=self.config.llm_model,
-            prompt_path=self.config.prompt_dir / "reranker" / "prompts" / "current.txt"
+            prompt_path=self.config.prompt_dir / "reranker" / "prompts" / "current.txt",
         )
 
         self.generator = GeneratorModule(
             model_name=self.config.llm_model,
-            prompt_path=self.config.prompt_dir / "generator" / "prompts" / "current.txt"
+            prompt_path=self.config.prompt_dir / "generator" / "prompts" / "current.txt",
         )
 
         self.evaluator = RAGASEvaluator(model=self.config.llm_model)
@@ -85,10 +84,10 @@ class ModularRAGPipeline:
     async def run(
         self,
         query: str,
-        ground_truth: Optional[str] = None,
-        relevant_chunk_indices: Optional[List[int]] = None,
-        retrieval_k: Optional[int] = None,
-        final_k: Optional[int] = None,
+        ground_truth: str | None = None,
+        relevant_chunk_indices: list[int] | None = None,
+        retrieval_k: int | None = None,
+        final_k: int | None = None,
     ) -> PipelineResult:
         """
         Execute the full RAG pipeline.
@@ -111,10 +110,7 @@ class ModularRAGPipeline:
         query_output = await self.query_planner.run(query_input)
 
         # Module 1: Retrieval
-        retrieval_input = RetrievalInput(
-            queries=query_output.queries,
-            top_k=retrieval_k
-        )
+        retrieval_input = RetrievalInput(queries=query_output.queries, top_k=retrieval_k)
         retrieval_output = await self.retriever.run(retrieval_input)
         print("retrieval_output", retrieval_output)
 
@@ -160,32 +156,29 @@ class ModularRAGPipeline:
                 "num_retrieved": len(retrieval_output.document_texts),
                 "num_ranked": len(ranked_docs),
                 "retrieved_chunk_indices": retrieval_output.chunk_indices,
-            }
+            },
         )
 
     async def run_module_1(
         self,
         query: str,
         retrieval_k: int = 20,
-        ground_truth: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        ground_truth: str | None = None,
+    ) -> dict[str, Any]:
         """
         Run only Module 1 (Query Planner + Retrieval) for independent evaluation.
         """
         query_input = QueryPlannerInput(query=query)
         query_output = await self.query_planner.run(query_input)
 
-        retrieval_input = RetrievalInput(
-            queries=query_output.queries,
-            top_k=retrieval_k
-        )
+        retrieval_input = RetrievalInput(queries=query_output.queries, top_k=retrieval_k)
         retrieval_output = await self.retriever.run(retrieval_input)
 
         # Evaluate retrieval
         retrieval_eval = await self.evaluator._evaluate_retrieval(
             retrieval_input,
             retrieval_output,
-            {'query': query, 'reference': ground_truth} if ground_truth else None
+            {"query": query, "reference": ground_truth} if ground_truth else None,
         )
 
         return {
@@ -197,9 +190,9 @@ class ModularRAGPipeline:
     async def run_module_2(
         self,
         query: str,
-        documents: List[str],
-        ground_truth: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        documents: list[str],
+        ground_truth: str | None = None,
+    ) -> dict[str, Any]:
         """
         Run only Module 2 (Reranker) for independent evaluation.
 
@@ -218,7 +211,7 @@ class ModularRAGPipeline:
         reranker_eval = await self.evaluator._evaluate_reranker(
             reranker_input,
             reranker_output,
-            {'query': query, 'reference': ground_truth} if ground_truth else None
+            {"query": query, "reference": ground_truth} if ground_truth else None,
         )
 
         return {
@@ -230,8 +223,8 @@ class ModularRAGPipeline:
         self,
         query: str,
         context: str,
-        ground_truth: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        ground_truth: str | None = None,
+    ) -> dict[str, Any]:
         """
         Run only Module 3 (Generator) for independent evaluation.
 
@@ -251,7 +244,9 @@ class ModularRAGPipeline:
         generator_eval = await self.evaluator._evaluate_generator(
             generator_input,
             generator_output,
-            {'query': query, 'contexts': contexts, 'reference': ground_truth} if ground_truth else None
+            {"query": query, "contexts": contexts, "reference": ground_truth}
+            if ground_truth
+            else None,
         )
 
         return {
@@ -263,31 +258,19 @@ class ModularRAGPipeline:
         """Save all module prompts with version tag"""
         base_path = self.config.prompt_dir
 
-        self.query_planner.save_prompt(
-            base_path / "query_planner" / "prompts", version
-        )
-        self.reranker.save_prompt(
-            base_path / "reranker" / "prompts", version
-        )
-        self.generator.save_prompt(
-            base_path / "generator" / "prompts", version
-        )
+        self.query_planner.save_prompt(base_path / "query_planner" / "prompts", version)
+        self.reranker.save_prompt(base_path / "reranker" / "prompts", version)
+        self.generator.save_prompt(base_path / "generator" / "prompts", version)
 
     def load_prompts(self, version: str = "v1") -> None:
         """Load all module prompts with version tag"""
         base_path = self.config.prompt_dir
 
-        self.query_planner.load_prompt(
-            base_path / "query_planner" / "prompts" / f"{version}.txt"
-        )
-        self.reranker.load_prompt(
-            base_path / "reranker" / "prompts" / f"{version}.txt"
-        )
-        self.generator.load_prompt(
-            base_path / "generator" / "prompts" / f"{version}.txt"
-        )
+        self.query_planner.load_prompt(base_path / "query_planner" / "prompts" / f"{version}.txt")
+        self.reranker.load_prompt(base_path / "reranker" / "prompts" / f"{version}.txt")
+        self.generator.load_prompt(base_path / "generator" / "prompts" / f"{version}.txt")
 
-    def get_module_prompts(self) -> Dict[str, str]:
+    def get_module_prompts(self) -> dict[str, str]:
         """Get all current module prompts"""
         return {
             "query_planner": self.query_planner.prompt or "",

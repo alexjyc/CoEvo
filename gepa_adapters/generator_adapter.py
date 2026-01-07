@@ -11,18 +11,18 @@ Target Metrics: faithfulness, answer_correctness
 Optimization Goal: Generate accurate answers grounded in context
 """
 
-from typing import Any, Dict, List, Optional, Tuple
-
-from gepa_adapters.base import (
-    RAGModuleAdapter,
-    RAGDataInst,
-    RAGTrajectory,
-    RAGRolloutOutput,
-)
-
 # Import module types
 import sys
 from pathlib import Path
+from typing import Any
+
+from gepa_adapters.base import (
+    RAGDataInst,
+    RAGModuleAdapter,
+    RAGRolloutOutput,
+    RAGTrajectory,
+)
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from modules.base import GeneratorInput
@@ -64,7 +64,7 @@ class GeneratorAdapter(RAGModuleAdapter):
     async def _run_single_async(
         self,
         data: RAGDataInst,
-    ) -> Tuple[RAGRolloutOutput, Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[RAGRolloutOutput, dict[str, Any], dict[str, Any]]:
         """
         Execute generator on a single example.
 
@@ -89,11 +89,15 @@ class GeneratorAdapter(RAGModuleAdapter):
             context_text = contexts or ""
 
         if not context_text:
-            return {
-                "result": None,
-                "success": False,
-                "error": "No context provided for generation",
-            }, {"query": query, "context": ""}, {}
+            return (
+                {
+                    "result": None,
+                    "success": False,
+                    "error": "No context provided for generation",
+                },
+                {"query": query, "context": ""},
+                {},
+            )
 
         # Run generator
         generator_input = GeneratorInput(
@@ -131,8 +135,8 @@ class GeneratorAdapter(RAGModuleAdapter):
     async def _compute_score_async(
         self,
         data: RAGDataInst,
-        module_output: Dict[str, Any],
-    ) -> Tuple[float, Dict[str, float]]:
+        module_output: dict[str, Any],
+    ) -> tuple[float, dict[str, float]]:
         """
         Compute generation quality score.
 
@@ -159,12 +163,10 @@ class GeneratorAdapter(RAGModuleAdapter):
         # Use evaluator for generation metrics
         generator_eval = await self.evaluator._evaluate_generator(
             input_data=GeneratorInput(query=query, context="\n\n".join(contexts)),
-            output_data=type('obj', (object,), {'answer': answer})(),
-            ground_truth={
-                "query": query,
-                "contexts": contexts,
-                "reference": ground_truth
-            } if ground_truth else None
+            output_data=type("obj", (object,), {"answer": answer})(),
+            ground_truth={"query": query, "contexts": contexts, "reference": ground_truth}
+            if ground_truth
+            else None,
         )
 
         faithfulness = generator_eval.get("faithfulness", 0.0)
@@ -189,7 +191,7 @@ class GeneratorAdapter(RAGModuleAdapter):
     def _format_trace_for_reflection(
         self,
         trajectory: RAGTrajectory,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Format trajectory into GEPA reflection record with rich feedback.
 
@@ -246,7 +248,7 @@ class GeneratorAdapter(RAGModuleAdapter):
     def _generate_rich_feedback(
         self,
         score: float,
-        metrics: Dict[str, float],
+        metrics: dict[str, float],
         ground_truth: str,
         generated_answer: str,
     ) -> str:
@@ -287,11 +289,11 @@ class GeneratorAdapter(RAGModuleAdapter):
 
         return feedback
 
-    def _positive_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _positive_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate positive feedback for high-quality generation"""
         return self._generate_rich_feedback(score, metrics, "", "")
 
-    def _negative_feedback(self, score: float, metrics: Dict[str, float]) -> str:
+    def _negative_feedback(self, score: float, metrics: dict[str, float]) -> str:
         """Generate improvement suggestions for low-quality generation"""
         return self._generate_rich_feedback(score, metrics, "", "")
 
@@ -299,6 +301,7 @@ class GeneratorAdapter(RAGModuleAdapter):
 # =============================================================================
 # Utility: Create adapter with standard configuration
 # =============================================================================
+
 
 def create_generator_adapter(
     generator_module,

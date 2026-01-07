@@ -18,34 +18,34 @@ Each module:
 
 # Base types
 from modules.base import (
-    Module,
-    ModuleType,
-    ModuleInput,
-    ModuleOutput,
-    ModuleEvaluator,
     EvaluationResult,
-    QueryPlannerInput,
-    QueryPlannerOutput,
-    RetrievalInput,
-    RetrievalOutput,
-    RerankerInput,
-    RerankerOutput,
     GeneratorInput,
     GeneratorOutput,
+    Module,
+    ModuleEvaluator,
+    ModuleInput,
+    ModuleOutput,
+    ModuleType,
     PipelineConfig,
+    QueryPlannerInput,
+    QueryPlannerOutput,
+    RerankerInput,
+    RerankerOutput,
+    RetrievalInput,
+    RetrievalOutput,
 )
-
-# Module implementations
-from modules.query_planner import QueryPlannerModule, HybridRetriever
-from modules.reranker import RerankerModule
-from modules.generator import GeneratorModule
-from modules.preprocessor import DocumentPreprocessor
 
 # Evaluation
 from modules.evaluation import RAGASEvaluator
+from modules.generator import GeneratorModule
 
 # Pipeline
 from modules.pipeline import ModularRAGPipeline, PipelineResult
+from modules.preprocessor import DocumentPreprocessor
+
+# Module implementations
+from modules.query_planner import HybridRetriever, QueryPlannerModule
+from modules.reranker import RerankerModule
 
 __all__ = [
     # Base types

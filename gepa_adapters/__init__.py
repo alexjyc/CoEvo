@@ -40,17 +40,17 @@ Usage:
 """
 
 from gepa_adapters.base import (
-    RAGDataInst,
-    RAGTrajectory,
-    RAGRolloutOutput,
-    EvaluationBatch,
-    RAGModuleAdapter,
-    optimize_prompt,
     GEPA_AVAILABLE,
+    EvaluationBatch,
+    RAGDataInst,
+    RAGModuleAdapter,
+    RAGRolloutOutput,
+    RAGTrajectory,
+    optimize_prompt,
 )
+from gepa_adapters.generator_adapter import GeneratorAdapter
 from gepa_adapters.query_planner_adapter import QueryPlannerAdapter
 from gepa_adapters.reranker_adapter import RerankerAdapter
-from gepa_adapters.generator_adapter import GeneratorAdapter
 
 __all__ = [
     # Base types

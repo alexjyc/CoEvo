@@ -9,10 +9,9 @@ Evaluation Metrics: context_relevancy, answer_relevancy (post-rerank)
 
 import os
 from pathlib import Path
-from typing import Optional, List
 
-from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from modules.base import (
@@ -25,7 +24,8 @@ from modules.base import (
 
 class DocumentRerankingResponse(BaseModel):
     """Structured response from reranker LLM"""
-    ranked_documents: List[str] = Field(
+
+    ranked_documents: list[str] = Field(
         description="List of documents ranked by relevance, most relevant first"
     )
 
@@ -43,7 +43,7 @@ class RerankerModule(Module[RerankerInput, RerankerOutput]):
     def __init__(
         self,
         model_name: str = "gpt-4o-mini",
-        prompt_path: Optional[Path] = None,
+        prompt_path: Path | None = None,
     ):
         super().__init__(ModuleType.RERANKER)
         self.model_name = model_name
@@ -51,15 +51,11 @@ class RerankerModule(Module[RerankerInput, RerankerOutput]):
         # Initialize LLM (frozen - only prompt changes)
         if model_name in ["gpt-4o-mini", "gpt-4o", "gpt-5-nano"]:
             self.llm = ChatOpenAI(
-                model=model_name,
-                temperature=0,
-                openai_api_key=os.getenv("OPENAI_API_KEY")
+                model=model_name, temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY")
             )
         elif model_name == "gemini-2.5-flash":
             self.llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                temperature=0,
-                google_api_key=os.getenv("GEMINI_API_KEY")
+                model=model_name, temperature=0, google_api_key=os.getenv("GEMINI_API_KEY")
             )
         else:
             raise ValueError(f"Unsupported model: {model_name}")
@@ -107,29 +103,22 @@ Rerank these documents:"""
         try:
             if not input.documents:
                 return RerankerOutput(
-                    status="success",
-                    ranked_documents=[],
-                    scores=[],
-                    metadata={"num_documents": 0}
+                    status="success", ranked_documents=[], scores=[], metadata={"num_documents": 0}
                 )
 
             # Format prompt
-            prompt = self._prompt.format(
-                query=input.query,
-                num_documents=len(input.documents)
-            )
+            prompt = self._prompt.format(query=input.query, num_documents=len(input.documents))
 
             # Format documents for input
-            numbered_docs = [f"[{i+1}] {doc}" for i, doc in enumerate(input.documents)]
+            numbered_docs = [f"[{i + 1}] {doc}" for i, doc in enumerate(input.documents)]
             documents_text = "\n\n".join(numbered_docs)
 
             # Get structured output from LLM
             structured_llm = self.llm.with_structured_output(DocumentRerankingResponse)
 
-            response: DocumentRerankingResponse = await structured_llm.ainvoke([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": documents_text}
-            ])
+            response: DocumentRerankingResponse = await structured_llm.ainvoke(
+                [{"role": "system", "content": prompt}, {"role": "user", "content": documents_text}]
+            )
 
             # Generate scores based on ranking position (1.0 for first, decreasing)
             num_docs = len(response.ranked_documents)
@@ -143,7 +132,7 @@ Rerank these documents:"""
                     "model": self.model_name,
                     "num_input_documents": len(input.documents),
                     "num_output_documents": len(response.ranked_documents),
-                }
+                },
             )
 
         except Exception as e:
