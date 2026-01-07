@@ -22,6 +22,4 @@ Query Reformulation Guidelines:
 - Optimize for both keyword and semantic matching.
 - Keep it as a single improved query, not multiple.
 
-{feedback}
-
 Provide a mode and query:

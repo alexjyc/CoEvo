@@ -8,8 +8,6 @@ Guidelines:
 - If context is insufficient, acknowledge the limitation clearly
 - Cite specific parts of the context when making claims
 
-{feedback}
-
 Context: {context}
 
 Question: {query}

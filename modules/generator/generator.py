@@ -92,8 +92,6 @@ Guidelines:
 - Include specific details when available
 - Acknowledge limitations if context is insufficient
 
-{feedback}
-
 Context: {context}
 
 Question: {query}
@@ -112,11 +110,9 @@ Provide a thorough answer:"""
         """
         try:
             # Format prompt
-            feedback_text = f"Feedback from previous execution:\n{input.feedback}" if input.feedback else ""
             prompt = self._prompt.format(
                 context=input.context,
-                query=input.query,
-                feedback=feedback_text
+                query=input.query
             )
 
             # Get structured output from LLM

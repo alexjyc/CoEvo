@@ -92,8 +92,6 @@ Decision Logic:
 - Multiple intents/constraints → Decomposition
 - Single intent but vague → Reformulation
 
-{feedback}
-
 Provide mode (decomposition/reformulation) and query/queries:"""
 
     async def run(self, input: QueryPlannerInput) -> QueryPlannerOutput:
@@ -107,9 +105,7 @@ Provide mode (decomposition/reformulation) and query/queries:"""
             QueryPlannerOutput with mode and processed queries
         """
         try:
-            # Format prompt with feedback
-            feedback_text = f"Feedback from previous execution:\n{input.feedback}" if input.feedback else ""
-            prompt = self._prompt.format(feedback=feedback_text)
+            prompt = self._prompt
 
             # Get structured output from LLM
             structured_llm = self.llm.with_structured_output(QueryPlannerResponse)

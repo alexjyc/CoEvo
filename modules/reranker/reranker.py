@@ -114,10 +114,8 @@ Rerank these documents:"""
                 )
 
             # Format prompt
-            feedback_text = f"Feedback from previous execution:\n{input.feedback}" if input.feedback else ""
             prompt = self._prompt.format(
                 query=input.query,
-                feedback=feedback_text,
                 num_documents=len(input.documents)
             )
 

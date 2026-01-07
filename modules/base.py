@@ -174,7 +174,6 @@ class ModuleEvaluator(ABC):
 class QueryPlannerInput(ModuleInput):
     """Input for Query Planner module"""
     query: str
-    feedback: Optional[str] = None
 
 
 @dataclass
@@ -206,7 +205,6 @@ class RerankerInput(ModuleInput):
     """Input for Reranker module"""
     query: str
     documents: List[str]  # Document texts to rerank
-    feedback: Optional[str] = None
 
 
 @dataclass
@@ -221,7 +219,6 @@ class GeneratorInput(ModuleInput):
     """Input for Generator module"""
     query: str
     context: str  # Concatenated relevant documents
-    feedback: Optional[str] = None
 
 
 @dataclass

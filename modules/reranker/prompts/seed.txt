@@ -14,8 +14,6 @@ Ranking Criteria:
 - Supporting examples and context rank third
 - Off-topic or tangential content ranks lowest
 
-{feedback}
-
 Query: {query}
 
 Rerank these {num_documents} documents by relevance (most relevant first, return ALL documents):
