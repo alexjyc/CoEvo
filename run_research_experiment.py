@@ -1702,14 +1702,31 @@ async def main(args):
         print("Error: OPENAI_API_KEY not set")
         return
 
+    # Load chunk size config if provided
+    chunk_size = args.chunk_size
+    chunk_overlap = args.chunk_overlap
+    if args.chunk_size_config:
+        try:
+            with open(args.chunk_size_config) as f:
+                chunk_config = json.load(f)
+            best = chunk_config.get("best", {})
+            chunk_size = best.get("chunk_size", args.chunk_size)
+            chunk_overlap = best.get("chunk_overlap", args.chunk_overlap)
+            print(f"Loaded chunk config from {args.chunk_size_config}")
+            print(f"  Using chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+            print(f"  Original NDCG@k: {best.get('ndcg_at_k', 'N/A')}")
+        except Exception as e:
+            print(f"Warning: Could not load chunk_size_config: {e}")
+            print(f"  Falling back to --chunk_size={args.chunk_size}, --chunk_overlap={args.chunk_overlap}")
+
     runner = ResearchExperimentRunner(
         experiment_name=args.experiment_name,
         output_dir=Path(args.output_dir),
         n_queries=args.n_queries,
         optimization_budget=args.budget,
         model=args.model,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         retrieval_k=args.retrieval_k,
         rerank_k=args.rerank_k,
         random_seed=args.seed,
@@ -1746,6 +1763,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--chunk_size", type=int, default=600)
     parser.add_argument("--chunk_overlap", type=int, default=50)
+    parser.add_argument(
+        "--chunk_size_config",
+        type=str,
+        default=None,
+        help="Path to chunk size optimization results JSON (overrides --chunk_size and --chunk_overlap)",
+    )
     parser.add_argument("--retrieval_k", type=int, default=20)
     parser.add_argument("--rerank_k", type=int, default=10)
     parser.add_argument("--max_concurrent", type=int, default=10)

@@ -17,6 +17,7 @@ GEPA Optimization Notes:
 """
 
 # Import module types
+import hashlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,26 @@ class RerankerAdapter(RAGModuleAdapter):
         )
         self.top_k = top_k
 
+    def _get_doc_key(self, doc: str) -> str:
+        """
+        Generate a unique key for a document for reliable matching.
+
+        Uses MD5 hash of normalized content for collision-resistant matching.
+        This is more reliable than truncation-based keys which can fail on
+        documents with similar prefixes.
+
+        Args:
+            doc: Document content string
+
+        Returns:
+            Hash-based key string
+        """
+        if not doc:
+            return ""
+        # Normalize whitespace and compute hash
+        normalized = " ".join(doc.split())
+        return hashlib.md5(normalized.encode()).hexdigest()
+
     async def _run_single_async(
         self,
         data: RAGDataInst,
@@ -115,18 +136,18 @@ class RerankerAdapter(RAGModuleAdapter):
         ranked_docs = reranker_output.ranked_documents[: self.top_k]
 
         # Map reranked documents to their chunk indices
-        # Build doc -> index mapping from original order
+        # Uses content hash for more reliable matching (handles near-duplicates better)
         reranked_chunk_indices = []
         if pre_rerank_chunk_indices:
             doc_to_idx = {}
             for i, (doc, idx) in enumerate(zip(documents, pre_rerank_chunk_indices)):
-                # Use first 200 chars as key to handle duplicates
-                doc_key = doc[:200] if doc else ""
+                # Use content hash as key - more reliable than truncation
+                doc_key = self._get_doc_key(doc)
                 if doc_key not in doc_to_idx:
                     doc_to_idx[doc_key] = idx
 
             for doc in ranked_docs:
-                doc_key = doc[:200] if doc else ""
+                doc_key = self._get_doc_key(doc)
                 if doc_key in doc_to_idx:
                     reranked_chunk_indices.append(doc_to_idx[doc_key])
                 else:

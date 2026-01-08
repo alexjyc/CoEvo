@@ -34,6 +34,7 @@ from modules.base import (
     RetrievalInput,
     RetrievalOutput,
 )
+from modules.chunk_optimizer import ChunkSizeOptimizer
 
 # Evaluation
 from modules.evaluation import RAGASEvaluator
@@ -70,6 +71,7 @@ __all__ = [
     "RerankerModule",
     "GeneratorModule",
     "DocumentPreprocessor",
+    "ChunkSizeOptimizer",
     # Evaluation
     "RAGASEvaluator",
     # Pipeline

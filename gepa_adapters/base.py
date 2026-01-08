@@ -24,8 +24,10 @@ Usage with gepa.optimize():
 """
 
 import asyncio
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Generic, TypedDict, TypeVar
 
@@ -196,9 +198,10 @@ class RAGModuleAdapter(_BaseClass):
         self.component_name = component_name
         self.failure_score = failure_score
         self._original_prompt: str | None = None
+        self._prompt_lock = threading.Lock()  # Thread-safe prompt management
 
     # -------------------------------------------------------------------------
-    # Prompt Management
+    # Prompt Management (Thread-Safe)
     # -------------------------------------------------------------------------
 
     @property
@@ -207,17 +210,47 @@ class RAGModuleAdapter(_BaseClass):
         return self.module.prompt or ""
 
     def inject_prompt(self, candidate: dict[str, str]) -> None:
-        """Inject candidate prompt into the module"""
+        """
+        Inject candidate prompt into the module.
+
+        Thread-safe: Uses lock to prevent race conditions.
+        """
         if self.component_name in candidate:
-            if self._original_prompt is None:
-                self._original_prompt = self.module.prompt
-            self.module.prompt = candidate[self.component_name]
+            with self._prompt_lock:
+                if self._original_prompt is None:
+                    self._original_prompt = self.module.prompt
+                self.module.prompt = candidate[self.component_name]
 
     def restore_prompt(self) -> None:
-        """Restore the original prompt after optimization"""
-        if self._original_prompt is not None:
-            self.module.prompt = self._original_prompt
-            self._original_prompt = None
+        """
+        Restore the original prompt after optimization.
+
+        Thread-safe: Uses lock to prevent race conditions.
+        """
+        with self._prompt_lock:
+            if self._original_prompt is not None:
+                self.module.prompt = self._original_prompt
+                self._original_prompt = None
+
+    @contextmanager
+    def prompt_context(self, candidate: dict[str, str]):
+        """
+        Context manager for thread-safe prompt injection and restoration.
+
+        Usage:
+            with adapter.prompt_context(candidate):
+                # Run evaluation with candidate prompt
+                result = await module.run(input)
+            # Original prompt automatically restored
+
+        Args:
+            candidate: Dict mapping component names to prompt strings
+        """
+        self.inject_prompt(candidate)
+        try:
+            yield
+        finally:
+            self.restore_prompt()
 
     def get_candidate(self) -> dict[str, str]:
         """Get current prompt as a candidate dict"""
