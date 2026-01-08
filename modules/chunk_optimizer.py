@@ -371,7 +371,8 @@ class ChunkSizeOptimizer:
             query_id = query_data.get("query_id")
 
             # Get relevant chunk indices from relevance labels
-            relevant_doc_ids = self.relevance_labels.get(query_id, [])
+            # Note: relevance_labels uses string keys, query_id may be int
+            relevant_doc_ids = self.relevance_labels.get(str(query_id), [])
             relevant_indices = []
             for doc_id in relevant_doc_ids:
                 if doc_id in doc_id_to_chunks:
