@@ -9,9 +9,16 @@ Module I/O:
 
 Target Metrics: faithfulness, answer_correctness
 Optimization Goal: Generate accurate answers grounded in context
+
+GEPA Optimization Notes:
+- Uses metric-based diagnostic feedback to avoid overfitting
+- Analyzes answer quality (context usage, query coverage, hedging)
+- Provides strategy-focused suggestions based on faithfulness/correctness patterns
+- NO ground truth in reflection records
 """
 
 # Import module types
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,11 +41,25 @@ class GeneratorAdapter(RAGModuleAdapter):
 
     This adapter optimizes the generation prompt to:
     - Produce answers that are faithful to the context
-    - Generate correct answers matching ground truth
+    - Generate accurate and complete answers
     - Provide proper references and rationale
+
+    Key Features for GEPA Optimization:
+    - Metric-based diagnostic feedback (no ground truth in reflection)
+    - Answer quality analysis (context usage, query coverage, hedging)
+    - Faithfulness vs correctness pattern diagnosis
+    - Strategy-focused improvement suggestions
 
     The optimization maximizes (faithfulness + answer_correctness) / 2.
     """
+
+    # Hedging words that indicate uncertainty
+    HEDGING_WORDS = {
+        "might", "could", "may", "possibly", "perhaps", "probably",
+        "likely", "unlikely", "seems", "appears", "suggest", "suggests",
+        "indicate", "indicates", "potential", "potentially", "uncertain",
+        "unclear", "approximately", "roughly", "about", "around",
+    }
 
     def __init__(
         self,
@@ -188,20 +209,148 @@ class GeneratorAdapter(RAGModuleAdapter):
 
         return generation_quality, metrics
 
+    # -------------------------------------------------------------------------
+    # Answer Quality Analysis (for diagnostic feedback without ground truth)
+    # -------------------------------------------------------------------------
+
+    def _analyze_answer_quality(
+        self,
+        answer: str,
+        context: str,
+        query: str,
+    ) -> dict[str, Any]:
+        """
+        Analyze answer characteristics without ground truth comparison.
+
+        Args:
+            answer: Generated answer text
+            context: Context provided to the generator
+            query: Original user query
+
+        Returns:
+            Dict with quality analysis metrics
+        """
+        if not answer:
+            return {
+                "answer_length": 0,
+                "context_coverage": 0.0,
+                "query_term_coverage": 0.0,
+                "hedging_level": 0.0,
+                "has_specific_details": False,
+            }
+
+        answer_words = answer.lower().split()
+        answer_length = len(answer_words)
+
+        # Measure context usage
+        context_coverage = self._measure_context_usage(answer, context)
+
+        # Measure query addressing
+        query_coverage = self._measure_query_addressing(answer, query)
+
+        # Detect hedging
+        hedging_level = self._detect_hedging(answer)
+
+        # Check for specific details (numbers, named entities, etc.)
+        has_specifics = bool(re.search(r'\d+|\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', answer))
+
+        return {
+            "answer_length": answer_length,
+            "context_coverage": context_coverage,
+            "query_term_coverage": query_coverage,
+            "hedging_level": hedging_level,
+            "has_specific_details": has_specifics,
+        }
+
+    def _measure_context_usage(self, answer: str, context: str) -> float:
+        """
+        Measure how much of the answer content comes from the context.
+
+        Args:
+            answer: Generated answer text
+            context: Context provided to the generator
+
+        Returns:
+            Score from 0-1 indicating context usage
+        """
+        if not answer or not context:
+            return 0.0
+
+        # Extract significant words (longer than 4 chars, not common)
+        answer_words = set(w.lower() for w in answer.split() if len(w) > 4)
+        context_words = set(w.lower() for w in context.split() if len(w) > 4)
+
+        if not answer_words:
+            return 0.0
+
+        # Measure overlap
+        overlap = len(answer_words & context_words)
+        return overlap / len(answer_words)
+
+    def _measure_query_addressing(self, answer: str, query: str) -> float:
+        """
+        Measure how well the answer addresses the query terms.
+
+        Args:
+            answer: Generated answer text
+            query: Original user query
+
+        Returns:
+            Score from 0-1 indicating query coverage
+        """
+        if not answer or not query:
+            return 0.0
+
+        # Extract query terms (significant words)
+        query_terms = set(w.lower() for w in query.split() if len(w) > 3)
+        answer_lower = answer.lower()
+
+        if not query_terms:
+            return 1.0  # No significant query terms to cover
+
+        # Count query terms present in answer
+        covered = sum(1 for term in query_terms if term in answer_lower)
+        return covered / len(query_terms)
+
+    def _detect_hedging(self, answer: str) -> float:
+        """
+        Detect hedging language that indicates uncertainty.
+
+        Args:
+            answer: Generated answer text
+
+        Returns:
+            Score from 0-1 indicating hedging level
+        """
+        if not answer:
+            return 0.0
+
+        words = answer.lower().split()
+        if not words:
+            return 0.0
+
+        hedge_count = sum(1 for w in words if w in self.HEDGING_WORDS)
+        return min(hedge_count / len(words) * 10, 1.0)  # Scale up, cap at 1.0
+
+    # -------------------------------------------------------------------------
+    # Reflective Dataset Generation (Enhanced for GEPA)
+    # -------------------------------------------------------------------------
+
     def _format_trace_for_reflection(
         self,
         trajectory: RAGTrajectory,
     ) -> dict[str, Any]:
         """
-        Format trajectory into GEPA reflection record with rich feedback.
+        Format trajectory into GEPA reflection record with diagnostic feedback.
 
         GEPA Best Practices Applied:
-        1. Include ground truth answer as a separate field
-        2. Show comparison between generated and expected
-        3. Provide specific, actionable improvement suggestions
+        1. NO ground truth in reflection (prevents overfitting)
+        2. Answer quality analysis (context usage, query coverage, hedging)
+        3. Metric-based faithfulness vs correctness diagnosis
+        4. Strategy-focused improvement suggestions
 
         Returns:
-            Dict with Inputs, Generated Outputs, Expected Answer, Feedback keys
+            Dict with Inputs, Generated Outputs, Quality Analysis, Feedback, Score
         """
         data = trajectory["data"]
         module_input = trajectory["module_input"]
@@ -227,20 +376,27 @@ class GeneratorAdapter(RAGModuleAdapter):
         if rationale:
             outputs_text += f"\n\nRationale: {rationale}"
 
-        # Format expected answer separately (for GEPA's reflection LLM)
-        ground_truth = data.get("ground_truth", "")
-        if ground_truth:
-            expected_text = f"Expected Answer: {ground_truth}"
-        else:
-            expected_text = "Expected Answer: Not available"
+        # Analyze answer quality
+        quality_analysis = self._analyze_answer_quality(answer, context, query)
 
-        # Generate rich feedback with ground truth comparison
-        feedback = self._generate_rich_feedback(score, metrics, ground_truth, answer)
+        # Add quality analysis to outputs
+        outputs_text += f"\n\nQuality Analysis: "
+        outputs_text += f"Context coverage={quality_analysis['context_coverage']:.0%}, "
+        outputs_text += f"Query term coverage={quality_analysis['query_term_coverage']:.0%}, "
+        outputs_text += f"Hedging level={quality_analysis['hedging_level']:.0%}"
+
+        # Generate diagnostic feedback (no ground truth)
+        feedback = self._generate_rich_feedback(
+            score=score,
+            metrics=metrics,
+            answer=answer,
+            context=context,
+            query=query,
+        )
 
         return {
             "Inputs": inputs_text,
             "Generated Outputs": outputs_text,
-            "Expected Answer": expected_text,
             "Feedback": feedback,
             "Score": f"{score:.3f}",
         }
@@ -249,53 +405,147 @@ class GeneratorAdapter(RAGModuleAdapter):
         self,
         score: float,
         metrics: dict[str, float],
-        ground_truth: str,
-        generated_answer: str,
+        answer: str,
+        context: str,
+        query: str,
     ) -> str:
-        """Generate rich feedback with contrastive comparison to ground truth."""
+        """
+        Generate diagnostic feedback for GEPA reflection (no ground truth).
+
+        Uses metric patterns and answer quality analysis to provide
+        strategy-focused improvement suggestions.
+
+        Args:
+            score: The primary metric score
+            metrics: All evaluation metrics
+            answer: Generated answer text
+            context: Context provided to the generator
+            query: Original user query
+
+        Returns:
+            Diagnostic feedback string with strategy suggestions
+        """
         faithfulness = metrics.get("faithfulness", 0)
         correctness = metrics.get("answer_correctness", 0)
 
-        # Determine performance tier (adaptive thresholds)
+        # Analyze answer quality
+        quality = self._analyze_answer_quality(answer, context, query)
+
+        # Determine performance tier and generate appropriate feedback
         if score >= 0.6:
-            feedback = f"GOOD: Score={score:.2f}. "
-            feedback += f"Faithfulness={faithfulness:.2f}, Correctness={correctness:.2f}. "
-            feedback += "Answer is well-grounded and accurate. "
-            if ground_truth:
-                feedback += "Matches expected answer closely."
+            return self._positive_feedback_diagnostic(score, metrics, quality)
         elif score >= 0.3:
-            feedback = f"PARTIAL: Score={score:.2f}. "
-            if faithfulness < correctness:
-                feedback += "ISSUE: Some claims not supported by context. "
-                feedback += "TRY: Only include information explicitly in context. "
-            elif correctness < faithfulness:
-                feedback += "ISSUE: Answer doesn't fully match expected response. "
-                if ground_truth:
-                    gt_preview = ground_truth[:200]
-                    feedback += f"EXPECTED: '{gt_preview}...'. "
-                feedback += "TRY: Focus on directly answering the question. "
-            else:
-                feedback += "Moderate quality. Improve both grounding and accuracy. "
+            return self._partial_feedback_diagnostic(score, metrics, quality)
         else:
-            feedback = f"POOR: Score={score:.2f}. "
-            if faithfulness < 0.3:
-                feedback += "CRITICAL: Answer contains hallucinations. "
-            if correctness < 0.3:
-                feedback += "CRITICAL: Answer is incorrect. "
-            if ground_truth:
-                gt_preview = ground_truth[:250]
-                feedback += f"MUST PRODUCE: '{gt_preview}...'. "
-            feedback += "REQUIREMENTS: (1) Ground every claim in context, (2) Answer the question directly, (3) No made-up information."
+            return self._negative_feedback_diagnostic(score, metrics, quality)
+
+    def _positive_feedback_diagnostic(
+        self,
+        score: float,
+        metrics: dict[str, float],
+        quality: dict[str, Any],
+    ) -> str:
+        """Generate positive feedback with reinforcement of what worked."""
+        faithfulness = metrics.get("faithfulness", 0)
+        correctness = metrics.get("answer_correctness", 0)
+
+        feedback = f"GOOD: Score={score:.2f}. "
+        feedback += f"Faithfulness={faithfulness:.2f}, Correctness={correctness:.2f}. "
+        feedback += "Answer is well-grounded and addresses the question. "
+
+        # Explain what worked based on quality analysis
+        if quality["context_coverage"] > 0.6:
+            feedback += "Strong context usage. "
+        if quality["query_term_coverage"] > 0.7:
+            feedback += "Good query term coverage. "
+        if quality["hedging_level"] < 0.2:
+            feedback += "Appropriately confident tone. "
+
+        feedback += "Continue this approach for similar questions."
+
+        return feedback
+
+    def _partial_feedback_diagnostic(
+        self,
+        score: float,
+        metrics: dict[str, float],
+        quality: dict[str, Any],
+    ) -> str:
+        """Generate feedback for partial success with strategy-focused improvements."""
+        faithfulness = metrics.get("faithfulness", 0)
+        correctness = metrics.get("answer_correctness", 0)
+
+        feedback = f"PARTIAL: Score={score:.2f}. "
+        feedback += f"Faithfulness={faithfulness:.2f}, Correctness={correctness:.2f}. "
+
+        # Diagnose based on metric patterns (no ground truth needed)
+        if faithfulness < correctness:
+            feedback += "PATTERN: Some claims may not be supported by context. "
+            feedback += "TRY: Ground every statement in explicit context quotes. "
+            if quality["context_coverage"] < 0.5:
+                feedback += f"Note: Only {quality['context_coverage']:.0%} context coverage. "
+        elif correctness < faithfulness:
+            feedback += "PATTERN: Answer is grounded but may not fully address the question. "
+            feedback += "TRY: Ensure response directly answers what was asked. "
+            if quality["query_term_coverage"] < 0.5:
+                feedback += f"Note: Only {quality['query_term_coverage']:.0%} query term coverage. "
+        else:
+            feedback += "PATTERN: Moderate quality on both grounding and accuracy. "
+            feedback += "TRY: Improve both context usage and question addressing. "
+
+        # Additional quality-based suggestions
+        if quality["hedging_level"] > 0.3:
+            feedback += "STRATEGY: Reduce hedging language - be more definitive when context supports it. "
+
+        return feedback
+
+    def _negative_feedback_diagnostic(
+        self,
+        score: float,
+        metrics: dict[str, float],
+        quality: dict[str, Any],
+    ) -> str:
+        """Generate detailed negative feedback with strategy-focused suggestions."""
+        faithfulness = metrics.get("faithfulness", 0)
+        correctness = metrics.get("answer_correctness", 0)
+
+        feedback = f"POOR: Score={score:.2f}. "
+        feedback += f"Faithfulness={faithfulness:.2f}, Correctness={correctness:.2f}. "
+
+        # Diagnose primary failure mode using metrics
+        if faithfulness < 0.3:
+            feedback += "CRITICAL: Low faithfulness - answer may contain unsupported claims. "
+            feedback += "The generated content may not be grounded in the provided context. "
+        if correctness < 0.3:
+            feedback += "CRITICAL: Low correctness - answer may not address the question properly. "
+
+        # Quality-based diagnosis
+        if quality["context_coverage"] < 0.3:
+            feedback += f"ISSUE: Only {quality['context_coverage']:.0%} of answer terms from context. "
+        if quality["query_term_coverage"] < 0.3:
+            feedback += f"ISSUE: Only {quality['query_term_coverage']:.0%} query terms addressed. "
+
+        # Strategy suggestions
+        feedback += "STRATEGIES: "
+        feedback += "(1) Quote directly from context to support claims, "
+        feedback += "(2) Address the question stem explicitly, "
+        feedback += "(3) Avoid adding information not in context. "
+
+        # Recovery guidance
+        if quality["hedging_level"] > 0.4:
+            feedback += "RECOVERY: Excessive hedging detected - be more definitive when evidence is clear. "
+        if not quality["has_specific_details"]:
+            feedback += "RECOVERY: Include specific details from context (names, numbers, facts). "
 
         return feedback
 
     def _positive_feedback(self, score: float, metrics: dict[str, float]) -> str:
-        """Generate positive feedback for high-quality generation"""
-        return self._generate_rich_feedback(score, metrics, "", "")
+        """Generate positive feedback for high-quality generation."""
+        return self._generate_rich_feedback(score, metrics, "", "", "")
 
     def _negative_feedback(self, score: float, metrics: dict[str, float]) -> str:
-        """Generate improvement suggestions for low-quality generation"""
-        return self._generate_rich_feedback(score, metrics, "", "")
+        """Generate improvement suggestions for low-quality generation."""
+        return self._generate_rich_feedback(score, metrics, "", "", "")
 
 
 # =============================================================================
